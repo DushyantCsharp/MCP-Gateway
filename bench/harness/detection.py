@@ -150,7 +150,12 @@ def environment(detector: Detector) -> dict[str, Any]:
             for key in ("model", "revision", "subfolder")
             if hasattr(detector, key)
         },
-        "data": {"built": manifest["built"], "files": manifest["files"], "inputs": manifest["inputs"]},
+        "data": {
+            "version": manifest.get("version", 1),
+            "built": manifest["built"],
+            "files": manifest["files"],
+            "inputs": manifest["inputs"],
+        },
         "os": platform.platform(),
         "python": platform.python_version(),
         "versions": {pkg: version(pkg) for pkg in ("mcp-customs", "onnxruntime", "tokenizers")},
@@ -171,7 +176,8 @@ def markdown(env: dict[str, Any], threshold: float, attacks: list[Scored], benig
         f"# Detection results: {env['detector']}",
         "",
         f"Measured {env['date']} at commit `{env['commit']}`, detector `{env['detector']}` "
-        f"{env['detector_config']}, threshold {threshold}. Data built {env['data']['built']} "
+        f"{env['detector_config']}, threshold {threshold}. Benchmark v{env['data'].get('version', 1)}, "
+        f"built {env['data']['built']} "
         f"(`manifest.json` hashes {', '.join(f'{k} {v[:12]}' for k, v in env['data']['files'].items())}).",
         "",
         "Rates are the share of samples flagged, with Wilson 95% intervals. **Test is the headline**: no "
