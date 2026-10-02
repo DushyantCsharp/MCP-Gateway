@@ -4,13 +4,13 @@ A security and governance gateway for MCP. It sits between an agent and its
 MCP servers and inspects every message in both directions: what goes out,
 what comes back, and what should not cross at all.
 
-> **Status: pre-release: identity, policy, audit and tracing.** With them
-> configured, every request is authenticated, every tool call is checked
-> against a policy and recorded in a hash-chained audit log before it runs,
-> and every exchange is traced, in both MCP protocol eras. Injection
-> detection, redaction, approvals and budgets land over the coming milestones
-> (see the [roadmap](#roadmap)). Until then the gateway does not inspect tool
-> results for injected instructions.
+> **Status: pre-release: identity, policy, audit, tracing and a first
+> injection detector.** With them configured, every request is authenticated,
+> every tool call is checked against a policy and recorded in a hash-chained
+> audit log before it runs, every exchange is traced, and tool results are
+> scored for prompt injection, in both MCP protocol eras. The detector is a
+> first layer with measured weaknesses (below). Redaction, approvals and
+> budgets land over the coming milestones (see the [roadmap](#roadmap)).
 >
 > Benchmark results (detection rate, false-positive rate, latency overhead,
 > and attack success rate with the gateway off vs on) will lead this README
@@ -141,6 +141,25 @@ run, against an independent restatement of the policy. See the
 - **Loud about gaps.** At start-up the gateway logs what it enforces, and
   warns if authentication, policy or audit is off.
 
+## Injection detection: first results
+
+Measured on the held-out test split of [benchmark v1](bench/datasets/DATASHEET.md)
+(attacks from InjecAgent, hard benign tool output), with ProtectAI's
+open-source DeBERTa classifier. Full results, including every miss by id, are in
+[bench/results](bench/results/detection-2026-10-02-classifier.md).
+
+| Threshold | Attacks caught | Legitimate output flagged |
+| --- | --- | --- |
+| model default (0.5) | 82.0% [78.5–85.0] | 36.0% [27.3–45.8] |
+| chosen on dev for ~5% false positives | 52.9% [48.7–57.1] | 4.0% [1.6–9.8] |
+
+95% Wilson intervals. The classifier was trained on prompts rather than tool
+output: it flags ordinary reviews, notes and logs (repetitive text especially),
+and its scores sit near 1.0 for both classes. It also costs 30 ms per result
+at the median and 4.8 s at p99 on long outputs. Run it in `flag` mode. Better
+layers, and attack categories it is not yet measured on (long retrieved
+documents, obfuscated and multi-step attacks), come next.
+
 ## Performance
 
 What the gateway adds to a `tools/call` (Apple M4, one gateway process;
@@ -204,11 +223,12 @@ response framing.
 | `src/mcp_customs/pipeline/` | stage interface, pipeline, policy stage, version-aware replies |
 | `src/mcp_customs/audit/` | hash chain, Postgres store, group-commit writer, verification |
 | `src/mcp_customs/telemetry/` | OpenTelemetry set-up and trace-context handling |
+| `src/mcp_customs/detectors/` | detector contract and the ONNX classifier |
 | `src/mcp_customs/jsonrpc.py` | strict JSON-RPC parsing |
 | `policies/examples/` | finance, read-only and coding agent policies |
 | `demo/` | sample MCP servers, scripted agent, stand-in identity provider, Compose stack |
 | `tests/contract/` | real-client tests through a running gateway: policy enforcement, audit, traces |
-| `bench/` | latency harness, methodology and committed results |
+| `bench/` | latency and detection harnesses, datasets and datasheet, committed results |
 | `docs/` | architecture, policy reference, build notes (what we found, milestone by milestone) |
 
 ## Roadmap
@@ -216,8 +236,8 @@ response framing.
 - [x] **Pass-through proxy:** both transport eras, contract tests, CI, Compose demo
 - [x] **Identity and policy:** JWT identity and task scopes, bound sessions, YAML policy with argument constraints
 - [x] **Audit and telemetry:** hash-chained audit log with `verify-audit`, OpenTelemetry spans, first latency numbers
-- [ ] **Injection detection, layer one:** rules on tool output, attack and benign datasets, per-category results
-- [ ] **Classifier and data protection:** open-source classifier layer, PII and secret redaction
+- [x] **Injection detection, layer one:** benchmark v1 (attack and hard benign sets, datasheet), injection stage with block/flag/strip, classifier detector, honest results with misses
+- [ ] **Second detector layer and data protection:** a cheap layer beside the classifier, PII and secret redaction, more attack categories (AgentDojo, obfuscated, multi-step)
 - [ ] **Approvals and budgets:** held calls in Postgres, approve/deny page, per-agent rate and cost limits
 - [ ] **End-to-end agent eval:** attack success rate with the gateway off vs on, stdio wrapper
 - [ ] **v0.1:** threat model, policy reference, reproducible results

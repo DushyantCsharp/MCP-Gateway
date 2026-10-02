@@ -4,6 +4,24 @@ Numbers the gateway publishes about itself, how they are measured, and how to
 reproduce them. Results are committed under `results/`, one file per run,
 named by date, each stating the commit, hardware and software it ran on.
 
+## Injection detection
+
+```bash
+uv sync --group bench                                    # classifier runtime and AgentDojo
+uv run python bench/datasets/build.py                    # build benchmark v1 from pinned sources
+uv run --group bench python bench/harness/detection.py   # score it (about 7 minutes on an M4)
+```
+
+The data, its sources and its limits are described in
+`datasets/DATASHEET.md` and `datasets/SOURCES.md`. The harness reports, per
+attack category and per benign class, the share of samples flagged, with
+Wilson 95% intervals, on the `test` split (headline) and `dev`. It also
+reports the operating points you get when the threshold is chosen on dev for
+a target false-positive rate and then applied to test. Misses and false
+positives are listed by sample id and score only, so a results file never
+republishes the attacks. `--scores` rescores an earlier run's JSON (for
+example at new thresholds) without running the model again.
+
 ## Latency overhead
 
 ```bash
