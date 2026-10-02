@@ -168,7 +168,40 @@ class InjectionStageConfig(_Model):
     """Detector threads; scoring is CPU-bound and runs off the event loop."""
 
 
-type StageConfig = Annotated[PolicyStageConfig | InjectionStageConfig, Field(discriminator="type")]
+class RedactionStageConfig(_Model):
+    """Keep secrets and personal data from crossing the gateway."""
+
+    type: Literal["redaction"]
+    mode: Literal["redact", "flag", "block"] = "redact"
+    requests: list[str] = Field(default_factory=lambda: ["secrets"])
+    """Kinds scrubbed from tool and prompt arguments: ``secrets``, ``pii`` or individual kinds."""
+    responses: list[str] = Field(default_factory=lambda: ["secrets", "pii"])
+    """Kinds scrubbed from what tools, resources and prompts return."""
+    allow: list[str] = Field(default_factory=list)
+    """Regular expressions for values never redacted, such as internal addresses (``.*@acme\\.example``)."""
+
+    @field_validator("requests", "responses")
+    @classmethod
+    def _known_kinds(cls, names: list[str]) -> list[str]:
+        from mcp_customs.detectors.sensitive import expand
+
+        expand(names)
+        return names
+
+    @field_validator("allow")
+    @classmethod
+    def _compiles(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"invalid allow pattern {pattern!r}: {exc}") from exc
+        return patterns
+
+
+type StageConfig = Annotated[
+    PolicyStageConfig | InjectionStageConfig | RedactionStageConfig, Field(discriminator="type")
+]
 
 
 class AuditConfig(_Model):

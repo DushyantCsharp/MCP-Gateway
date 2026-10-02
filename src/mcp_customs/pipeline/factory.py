@@ -2,10 +2,12 @@
 
 from collections.abc import Sequence
 
-from mcp_customs.config import InjectionStageConfig, PolicyStageConfig, StageConfig
+from mcp_customs.config import InjectionStageConfig, PolicyStageConfig, RedactionStageConfig, StageConfig
+from mcp_customs.detectors.sensitive import SensitiveScanner
 from mcp_customs.pipeline.base import Pipeline, Stage
 from mcp_customs.pipeline.injection import InjectionStage
 from mcp_customs.pipeline.policy import PolicyStage
+from mcp_customs.pipeline.redaction import RedactionStage
 from mcp_customs.policy.engine import RulePolicy
 
 
@@ -20,6 +22,11 @@ def build_stage(config: StageConfig) -> Stage:
             detector.load()  # downloads the model on first start, and fails fast if it cannot
             return InjectionStage(
                 detector, mode=config.mode, threshold=config.threshold, threads=config.threads
+            )
+        case RedactionStageConfig():
+            scanner = SensitiveScanner(sorted({*config.requests, *config.responses}), allow=config.allow)
+            return RedactionStage(
+                scanner, requests=config.requests, responses=config.responses, mode=config.mode
             )
 
 

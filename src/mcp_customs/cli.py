@@ -20,7 +20,13 @@ from mcp_customs.audit import AuditStoreError, Hasher
 from mcp_customs.audit.verify import verify_database
 from mcp_customs.auth import JwtAuthenticator
 from mcp_customs.auth.identity import Identity, parse_grants
-from mcp_customs.config import ConfigError, GatewayConfig, PolicyStageConfig, load_config
+from mcp_customs.config import (
+    ConfigError,
+    GatewayConfig,
+    InjectionStageConfig,
+    PolicyStageConfig,
+    load_config,
+)
 from mcp_customs.pipeline.factory import build_pipeline
 from mcp_customs.policy import PolicyError, PolicyRequest, RulePolicy, TargetKind
 
@@ -100,7 +106,14 @@ def check_config(config: ConfigOption = Path("customs.yaml")) -> None:
         )
         typer.echo(f"  auth: JWT ({source}), audience {jwt_config.audience!r}")
     for stage in settings.stages:
-        detail = stage.file if isinstance(stage, PolicyStageConfig) else f"{stage.detector}, {stage.mode}"
+        match stage:
+            case PolicyStageConfig():
+                detail = str(stage.file)
+            case InjectionStageConfig():
+                detail = f"{stage.detector}, {stage.mode}"
+            case _:
+                sides = f"requests {', '.join(stage.requests)}; responses {', '.join(stage.responses)}"
+                detail = f"{stage.mode}; {sides}"
         typer.echo(f"  stage: {stage.type} ({detail})")
     if settings.audit is None:
         typer.echo("  audit: none (calls are not recorded)")

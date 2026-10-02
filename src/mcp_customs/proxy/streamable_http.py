@@ -72,6 +72,7 @@ from mcp_customs.pipeline.base import (
 from mcp_customs.proxy.headers import client_response_headers, upstream_request_headers
 from mcp_customs.proxy.observe import Instruments, Observation
 from mcp_customs.proxy.routing import protocol_version_of, routing_header_mismatch
+from mcp_customs.proxy.schemas import ToolSchemas
 from mcp_customs.proxy.sse import SseError, SseEvent, SseParser, encode_event
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ logger = logging.getLogger(__name__)
 SSE_MEDIA_TYPE: Final = "text/event-stream"
 JSON_MEDIA_TYPE: Final = "application/json"
 SESSION_HEADER: Final = "mcp-session-id"
+PARAM_PREFIX: Final = "mcp-param-"
 _ANSWER_KINDS: Final = frozenset({MessageKind.RESPONSE, MessageKind.ERROR})
 
 
@@ -202,6 +204,7 @@ class StreamableHttpProxy:
         self._authenticator = authenticator
         self._sessions = sessions
         self._instruments = instruments or Instruments.none()
+        self._schemas = ToolSchemas()
 
     async def handle(self, request: Request, upstream_name: str) -> Response:
         obs = self._instruments.begin(request, upstream_name)
@@ -246,8 +249,13 @@ class StreamableHttpProxy:
             response.headers["www-authenticate"] = challenge
         return response
 
-    def _upstream_headers(self, request: Request, route: _Route, obs: Observation) -> list[tuple[str, str]]:
+    def _upstream_headers(
+        self, request: Request, route: _Route, obs: Observation, params: dict[str, str] | None = None
+    ) -> list[tuple[str, str]]:
         headers = upstream_request_headers(_latin1_pairs(request.headers.raw), route.upstream.headers)
+        if params is not None:  # arguments were rewritten: the mirrored headers must follow them
+            headers = [(name, value) for name, value in headers if not name.lower().startswith(PARAM_PREFIX)]
+            headers.extend(params.items())
         if request.headers.get(SESSION_HEADER) is not None:
             headers = _set_header(headers, SESSION_HEADER, route.session_id)
         for name, value in obs.upstream_headers().items():
@@ -285,6 +293,7 @@ class StreamableHttpProxy:
         exchange = route.exchange(request, protocol_version_of(message, request.headers))
         obs.parsed(message, exchange)
         ctx = ClientMessageContext(exchange, message)
+        rewritten = False
         if self._pipeline:
             try:
                 with obs.active():
@@ -305,8 +314,25 @@ class StreamableHttpProxy:
                 case Replace(message=replacement):
                     message = Message(replacement, message.kind)
                     body = dumps(replacement)
+                    rewritten = True
                 case _:
                     pass
+
+        params: dict[str, str] | None = None
+        mirrored = any(name.startswith(PARAM_PREFIX) for name in request.headers)
+        if rewritten and mirrored and message.method == "tools/call":
+            tool = message.params.get("name")
+            if isinstance(tool, str):
+                params = self._schemas.param_headers(route.name, tool, message.params.get("arguments"))
+            if params is None:
+                reason = (
+                    "arguments mirrored in Mcp-Param headers were rewritten, but the tool's schema is unknown"
+                )
+                error = error_object(
+                    message.id, INTERNAL_ERROR, f"The gateway cannot forward this call: {reason}"
+                )
+                await obs.stopped("error", error, None, ctx.annotations, reason)
+                return await _answered(obs, 500, error, reason)
 
         try:
             await obs.forwarding(ctx.annotations)
@@ -320,7 +346,7 @@ class StreamableHttpProxy:
         upstream_request = self._http.build_request(
             "POST",
             str(route.upstream.url),
-            headers=self._upstream_headers(request, route, obs),
+            headers=self._upstream_headers(request, route, obs, params),
             content=body,
             timeout=self._timeout(route.upstream, stream=False),
         )
@@ -421,6 +447,7 @@ class StreamableHttpProxy:
         if not self._answers(message, flow.request):
             logger.warning("upstream %s answered a request it was not asked", upstream)
             return await self._failed(flow, 502, UPSTREAM_BAD_RESPONSE, "Upstream answered the wrong request")
+        self._learn(flow, message)
         try:
             replacement = await self._run_server_stages(flow, message)
         except _WithheldError:
@@ -485,6 +512,7 @@ class StreamableHttpProxy:
             logger.warning("dropped an answer to a request upstream %s was not asked", upstream)
             return b"", False
         answered = flow.request is not None and message.kind in _ANSWER_KINDS
+        self._learn(flow, message)
         try:
             replacement = await self._run_server_stages(flow, message)
         except _WithheldError:
@@ -497,6 +525,15 @@ class StreamableHttpProxy:
             return event.raw, answered
         data = dumps(replacement).decode("utf-8")
         return encode_event(data, event=event.event, event_id=event.id), answered
+
+    def _learn(self, flow: _Flow, message: Message) -> None:
+        """Remember tool schemas from a tools/list answer, as the upstream sent it."""
+        if (
+            flow.request is not None
+            and flow.request.method == "tools/list"
+            and message.kind is MessageKind.RESPONSE
+        ):
+            self._schemas.learn(flow.exchange.upstream, message.raw.get("result"))
 
     @staticmethod
     def _answers(message: Message, request_message: Message | None) -> bool:
