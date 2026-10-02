@@ -30,6 +30,8 @@ def test_valid_messages_are_classified(body: object, kind: MessageKind) -> None:
         (b'{"a": 1, "a": 2}', jsonrpc.PARSE_ERROR),
         (b'{"jsonrpc":"2.0","id":1,"method":"m","params":{"x":{"y":1,"y":2}}}', jsonrpc.PARSE_ERROR),
         (b'{"jsonrpc":"2.0","id":1,"method":"m","params":{"x":Infinity}}', jsonrpc.PARSE_ERROR),
+        (b'{"jsonrpc":"2.0","id":1,"method":"m","params":{"x":1e400}}', jsonrpc.PARSE_ERROR),
+        (b'{"jsonrpc":"2.0","id":1,"method":"m","params":{"x":-1e400}}', jsonrpc.PARSE_ERROR),
         (b"[" * 100_000, jsonrpc.PARSE_ERROR),
         (b"[]", jsonrpc.INVALID_REQUEST),
         (b'"just a string"', jsonrpc.INVALID_REQUEST),

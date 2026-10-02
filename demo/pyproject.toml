@@ -5,7 +5,9 @@ description = "Sample MCP servers and a scripted agent used by the mcp-customs d
 requires-python = ">=3.12"
 license = "Apache-2.0"
 dependencies = [
+    "httpx2>=2.13.1",
     "mcp>=2.2,<3",
+    "pyjwt[crypto]>=2.10",
     "uvicorn[standard]>=0.54.0",
 ]
 
@@ -13,6 +15,7 @@ dependencies = [
 customs-demo-workspace = "customs_demo.workspace_server:main"
 customs-demo-finance = "customs_demo.finance_server:main"
 customs-demo-agent = "customs_demo.agent:main"
+customs-demo-issuer = "customs_demo.issuer:main"
 
 [build-system]
 requires = ["uv_build>=0.11.14,<0.13"]

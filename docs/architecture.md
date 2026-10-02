@@ -13,29 +13,68 @@ client sends is what the server receives, unless a stage changes it.
    │  POST/GET/DELETE /mcp/<upstream>
    ▼
 ┌──────────────────────────── gateway ────────────────────────────┐
-│ 1. route        unknown upstream → 404                          │
-│ 2. origin       foreign browser Origin → 403                    │
-│ 3. read body    size limit → 413                                │
-│ 4. parse        exactly one strict JSON-RPC message → else 400  │
-│ 5. routing      Mcp-Method / Mcp-Name agree with body → else 400│
-│ 6. pipeline     client stages: continue / replace / respond     │
-│ 7. forward      filtered headers, original bytes                │
+│ 1. origin       foreign browser Origin → 403                    │
+│ 2. identity     bearer JWT verified → else 401                  │
+│ 3. route        unknown upstream → 404                          │
+│ 4. session      session id bound to this agent → else 404       │
+│ 5. read body    size limit → 413                                │
+│ 6. parse        exactly one strict JSON-RPC message → else 400  │
+│ 7. routing      Mcp-Method / Mcp-Name agree with body → else 400│
+│ 8. pipeline     client stages (policy, ...): continue / replace │
+│                 / respond                                       │
+│ 9. forward      filtered headers, original bytes                │
 └───────────────────────────────┬─────────────────────────────────┘
                                 ▼
                        upstream MCP server
                                 │  application/json  or  text/event-stream
 ┌───────────────────────────────▼─────────────────────────────────┐
-│ 8. relay        JSON body, or SSE event by event                │
-│ 9. validate     strict JSON-RPC; answers match the request id   │
-│10. pipeline     server stages: continue / replace               │
-│11. return       original bytes unless replaced                  │
+│10. relay        JSON body, or SSE event by event                │
+│11. validate     strict JSON-RPC; answers match the request id   │
+│12. pipeline     server stages (listing filter, ...): continue / │
+│                 replace                                         │
+│13. return       original bytes unless replaced; session id      │
+│                 re-bound to the agent                           │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-The stages planned for the pipeline, in order, are authentication, policy,
-request guards, approval and response guards. Weekend 1 ships the pipeline
-with no stages configured; the hooks are exercised by test stages in
-`tests/contract/test_pipeline_seam.py`.
+Identity is checked at the HTTP layer, before anything else, so it covers
+every request including GET streams and DELETEs. The pipeline then runs the
+configured stages in order. The policy stage ships now. Request guards,
+approval and response guards follow, each as a new stage class plus one
+entry under `stages:` in the configuration.
+
+## Identity and sessions
+
+With `auth` configured, every request to `/mcp/<upstream>` needs
+`Authorization: Bearer <JWT>`. The token must be signed with a configured key
+(shared secret, PEM public key, or the issuer's JWKS), unexpired, issued for
+the gateway's audience and, if set, by the configured issuer. Only the
+configured algorithms are accepted. A missing or bad token gets a `401` with
+an RFC 6750 `WWW-Authenticate` challenge, before the gateway reveals whether
+the upstream exists. The token never travels upstream.
+
+Handshake-era sessions are bound to the agent that opened them. The gateway
+never shows the client the upstream's `Mcp-Session-Id`. It issues
+`<upstream id>.<tag>`, where the tag is an HMAC over the upstream, the agent
+and the upstream id, and strips the tag again on the way in. A request that
+presents another agent's session id, or an untagged one, gets the `404` the
+spec prescribes for an unknown session: a legitimate client starts a new
+session, and the caller learns nothing. The binding is stateless, so it
+survives restarts and works across replicas that share `auth.session_secret`.
+Without that key, a random one is generated at start-up, and sessions do not
+outlive the process.
+
+## Policy
+
+The policy stage decides every request that names a tool, prompt, resource
+or unknown method, from the caller's identity, the upstream, the target and
+the arguments. Deny rules win, nothing is allowed by default, and an argument
+the gateway cannot check counts against the call. A denied `tools/call` comes
+back as a tool error the model can read; other denials are JSON-RPC errors.
+Listings are filtered so a model is never offered what it may not call. The
+rules and their semantics are in the [policy reference](policy-reference.md).
+The engine sits behind a small interface (`PolicyEngine`), so an OPA or Cedar
+adapter could replace it.
 
 ## Two protocol eras, one proxy
 
@@ -86,8 +125,13 @@ check each one:
 
 | Situation | Client receives |
 | --- | --- |
+| Missing or invalid token | `401`, JSON-RPC `-32083`, `WWW-Authenticate` challenge |
+| Token issuer's keys unreachable (none cached) | `503`, JSON-RPC `-32083` |
 | Unknown upstream | `404`, JSON-RPC `-32600` |
 | Foreign `Origin` | `403`, JSON-RPC `-32600` |
+| Session id not bound to this agent | `404`, JSON-RPC `-32084` |
+| Tool call denied by policy | tool result with `isError: true` |
+| Other request denied by policy | `200`, JSON-RPC `-32090` |
 | Body over `limits.max_request_bytes` | `413` |
 | Malformed body | `400`, `-32700` or `-32600` |
 | Routing header mismatch | `400`, `-32020` |
@@ -121,8 +165,9 @@ return `Replace(...)` to rewrite it.
 
 ## Known limitations
 
-- No authentication, policy or detection yet. In v0.0.1 the gateway is a
-  faithful pass-through and must not be relied on as a security control.
+- No injection detection, data redaction, approvals, budgets or audit log
+  yet. Identity and policy hold for what they cover. The gateway does not yet
+  look inside tool results for injected instructions.
 - JSON-RPC batches are refused. Batching was removed from MCP in 2025-06-18
   and is not part of the stateless revision.
 - A client that disconnects before the upstream has sent response headers

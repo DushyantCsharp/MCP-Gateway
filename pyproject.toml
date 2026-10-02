@@ -22,6 +22,7 @@ dependencies = [
     "httpx2>=2.13.1",
     "mcp>=2.2,<3",
     "pydantic>=2.13.5",
+    "pyjwt[crypto]>=2.10",
     "pyyaml>=6.0.3",
     "typer>=0.27.2",
     "uvicorn[standard]>=0.54.0",
@@ -33,6 +34,7 @@ customs = "mcp_customs.cli:app"
 [dependency-groups]
 dev = [
     "customs-demo",
+    "hypothesis>=6",
     "mypy>=2.4",
     "pre-commit>=4.6",
     "pytest>=9.1",

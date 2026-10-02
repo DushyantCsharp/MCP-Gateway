@@ -18,7 +18,7 @@ env:
 jobs:
   lint:
     name: Lint and format
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -31,7 +31,7 @@ jobs:
 
   typecheck:
     name: Type-check (mypy --strict)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
@@ -43,7 +43,7 @@ jobs:
 
   test:
     name: Tests (Python ${{ matrix.python }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -60,7 +60,7 @@ jobs:
 
   demo:
     name: Demo stack end to end
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [test]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -68,6 +68,16 @@ jobs:
         run: docker compose -f demo/compose.yaml up --build --wait
       - name: Agent completes its task through the gateway
         run: docker compose -f demo/compose.yaml run --rm agent
+      - name: Policy blocks the over-limit payment
+        run: |
+          set +e
+          docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent
+          status=$?
+          set -e
+          if [ "$status" -ne 3 ]; then
+            echo "expected the payment to be blocked (exit 3), got exit $status"
+            exit 1
+          fi
       - name: Stack logs
         if: failure()
         run: docker compose -f demo/compose.yaml logs

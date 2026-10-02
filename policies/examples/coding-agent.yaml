@@ -1,0 +1,47 @@
+# A coding agent working in one repository through a hypothetical "repo" MCP
+# server (read_file, list_files, search_code, write_file, run_command). It may
+# read anything, write only source and tests, and run only the project's
+# checks. Secrets and CI configuration are off limits.
+version: 1
+description: Coding agent confined to source, tests and the project's own checks.
+
+rules:
+  - id: read-the-repo
+    effect: allow
+    agents: [coding-agent]
+    upstreams: [repo]
+    tools: [read_file, list_files, search_code]
+
+  - id: write-source-and-tests
+    effect: allow
+    agents: [coding-agent]
+    upstreams: [repo]
+    tools: [write_file]
+    arguments:
+      path: {matches: '(src|tests)/[A-Za-z0-9_./-]+\.py', not_matches: '.*\.\./.*'}
+      content: {max_length: 200000}
+    additional_arguments: false
+
+  - id: run-checks-only
+    description: One of the project's checks, with no shell metacharacters.
+    effect: allow
+    agents: [coding-agent]
+    upstreams: [repo]
+    tools: [run_command]
+    arguments:
+      command: {matches: '(uv run )?(pytest|mypy|ruff check|ruff format --check)( [A-Za-z0-9_./=:-]+)*'}
+    additional_arguments: false
+
+  - id: never-read-secrets
+    effect: deny
+    upstreams: [repo]
+    tools: [read_file, write_file]
+    arguments:
+      path: {matches: '(.*/)?(\.env[^/]*|.*\.pem|.*\.key|id_rsa.*)'}
+
+  - id: never-touch-ci
+    effect: deny
+    upstreams: [repo]
+    tools: [write_file]
+    arguments:
+      path: {matches: '\.github/.*'}

@@ -21,6 +21,7 @@ stage changes them. What the proxy does insist on:
 
 import logging
 from collections.abc import AsyncIterator, Iterable
+from dataclasses import dataclass
 from typing import Final
 
 import anyio
@@ -28,11 +29,14 @@ import httpx2
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
+from mcp_customs.auth import AuthError, Identity, JwtAuthenticator, SessionBinder, www_authenticate
 from mcp_customs.config import GatewayConfig, UpstreamConfig
 from mcp_customs.jsonrpc import (
     HEADER_MISMATCH,
     INTERNAL_ERROR,
     INVALID_REQUEST,
+    SESSION_NOT_FOUND,
+    UNAUTHENTICATED,
     UPSTREAM_BAD_RESPONSE,
     UPSTREAM_TIMEOUT,
     UPSTREAM_UNAVAILABLE,
@@ -65,7 +69,29 @@ logger = logging.getLogger(__name__)
 
 SSE_MEDIA_TYPE: Final = "text/event-stream"
 JSON_MEDIA_TYPE: Final = "application/json"
+SESSION_HEADER: Final = "mcp-session-id"
 _ANSWER_KINDS: Final = frozenset({MessageKind.RESPONSE, MessageKind.ERROR})
+
+
+@dataclass(frozen=True, slots=True)
+class _Route:
+    """One authenticated request, resolved to its upstream."""
+
+    name: str
+    upstream: UpstreamConfig
+    identity: Identity | None
+    session_id: str | None
+    """The upstream's session id, after unbinding the one the client sent."""
+
+    def exchange(self, request: Request, protocol_version: str | None) -> Exchange:
+        return Exchange(
+            upstream=self.name,
+            http_method=request.method,
+            headers=request.headers,
+            protocol_version=protocol_version,
+            session_id=self.session_id,
+            identity=self.identity,
+        )
 
 
 class _BodyTooLargeError(Exception):
@@ -82,6 +108,12 @@ def _media_type(content_type: str | None) -> str:
 
 def _latin1_pairs(raw: Iterable[tuple[bytes, bytes]]) -> list[tuple[str, str]]:
     return [(name.decode("latin-1"), value.decode("latin-1")) for name, value in raw]
+
+
+def _set_header(headers: list[tuple[str, str]], name: str, value: str | None) -> list[tuple[str, str]]:
+    """Replace every ``name`` header with one carrying ``value`` (or none, for ``None``)."""
+    kept = [(key, existing) for key, existing in headers if key.lower() != name]
+    return kept if value is None else [*kept, (name, value)]
 
 
 def _with_headers[R: Response](response: R, headers: Iterable[tuple[str, str]]) -> R:
@@ -124,25 +156,79 @@ async def _close_quietly(response: httpx2.Response) -> None:
 
 
 class StreamableHttpProxy:
-    def __init__(self, config: GatewayConfig, http: httpx2.AsyncClient, pipeline: Pipeline) -> None:
+    def __init__(
+        self,
+        config: GatewayConfig,
+        http: httpx2.AsyncClient,
+        pipeline: Pipeline,
+        *,
+        authenticator: JwtAuthenticator | None = None,
+        sessions: SessionBinder | None = None,
+    ) -> None:
         self._config = config
         self._http = http
         self._pipeline = pipeline
+        self._authenticator = authenticator
+        self._sessions = sessions
 
     async def handle(self, request: Request, upstream_name: str) -> Response:
-        upstream = self._config.upstreams.get(upstream_name)
-        if upstream is None:
-            return error_response(404, None, INVALID_REQUEST, f"Unknown upstream {upstream_name!r}")
         origin = request.headers.get("origin")
         if origin is not None and origin not in self._config.security.allowed_origins:
             return error_response(403, None, INVALID_REQUEST, "Origin not allowed")
+
+        # Authenticate before revealing anything, including which upstreams exist.
+        identity: Identity | None = None
+        if self._authenticator is not None:
+            try:
+                identity = await self._authenticator.authenticate(request.headers.get("authorization"))
+            except AuthError as exc:
+                return self._unauthenticated(exc)
+
+        upstream = self._config.upstreams.get(upstream_name)
+        if upstream is None:
+            return error_response(404, None, INVALID_REQUEST, f"Unknown upstream {upstream_name!r}")
+
+        session_id = request.headers.get(SESSION_HEADER)
+        if session_id is not None and self._sessions is not None and identity is not None:
+            session_id = self._sessions.unbind(upstream_name, identity.agent, session_id)
+            if session_id is None:
+                # 404 is what the spec prescribes for an unknown session: a client
+                # whose session predates a key change starts a new one, and a
+                # caller holding someone else's id learns nothing.
+                return error_response(404, None, SESSION_NOT_FOUND, "Session not found")
+
+        route = _Route(upstream_name, upstream, identity, session_id)
         if request.method == "POST":
-            return await self._post(request, upstream_name, upstream)
-        return await self._forward_bodiless(request, upstream_name, upstream)
+            return await self._post(request, route)
+        return await self._forward_bodiless(request, route)
+
+    def _unauthenticated(self, exc: AuthError) -> Response:
+        response = error_response(exc.status, None, UNAUTHENTICATED, exc.description)
+        if exc.status == 401:
+            metadata = self._config.auth.resource_metadata_url if self._config.auth else None
+            challenge = www_authenticate(exc, resource_metadata_url=str(metadata) if metadata else None)
+            response.headers["www-authenticate"] = challenge
+        return response
+
+    def _upstream_headers(self, request: Request, route: _Route) -> list[tuple[str, str]]:
+        headers = upstream_request_headers(_latin1_pairs(request.headers.raw), route.upstream.headers)
+        if request.headers.get(SESSION_HEADER) is not None:
+            headers = _set_header(headers, SESSION_HEADER, route.session_id)
+        return headers
+
+    def _client_headers(
+        self, upstream_response: httpx2.Response, exchange: Exchange
+    ) -> list[tuple[str, str]]:
+        headers = client_response_headers(upstream_response.headers.multi_items())
+        session_id = upstream_response.headers.get(SESSION_HEADER)
+        if session_id is not None and self._sessions is not None and exchange.identity is not None:
+            bound = self._sessions.bind(exchange.upstream, exchange.identity.agent, session_id)
+            headers = _set_header(headers, SESSION_HEADER, bound)
+        return headers
 
     # -- client to server ------------------------------------------------------------------------
 
-    async def _post(self, request: Request, upstream_name: str, upstream: UpstreamConfig) -> Response:
+    async def _post(self, request: Request, route: _Route) -> Response:
         try:
             body = await _read_request_body(request, self._config.limits.max_request_bytes)
         except _BodyTooLargeError:
@@ -156,18 +242,12 @@ class StreamableHttpProxy:
         if (mismatch := routing_header_mismatch(message, request.headers, raw_headers)) is not None:
             return error_response(400, message.id, HEADER_MISMATCH, mismatch)
 
-        exchange = Exchange(
-            upstream=upstream_name,
-            http_method="POST",
-            headers=request.headers,
-            protocol_version=protocol_version_of(message, request.headers),
-            session_id=request.headers.get("mcp-session-id"),
-        )
+        exchange = route.exchange(request, protocol_version_of(message, request.headers))
         if self._pipeline:
             try:
                 outcome = await self._pipeline.client_message(ClientMessageContext(exchange, message))
             except (StageFailedError, InvalidReplacementError, JsonRpcError):
-                logger.exception("pipeline failed on %s to %s; not forwarded", message.method, upstream_name)
+                logger.exception("pipeline failed on %s to %s; not forwarded", message.method, route.name)
                 return error_response(500, message.id, INTERNAL_ERROR, "Gateway pipeline error")
             match outcome:
                 case Respond(message=reply):
@@ -182,34 +262,26 @@ class StreamableHttpProxy:
 
         upstream_request = self._http.build_request(
             "POST",
-            str(upstream.url),
-            headers=upstream_request_headers(raw_headers, upstream.headers),
+            str(route.upstream.url),
+            headers=self._upstream_headers(request, route),
             content=body,
-            timeout=self._timeout(upstream, stream=False),
+            timeout=self._timeout(route.upstream, stream=False),
         )
-        upstream_response = await self._send(upstream_request, upstream_name, message.id)
+        upstream_response = await self._send(upstream_request, route.name, message.id)
         if isinstance(upstream_response, Response):
             return upstream_response
         return await self._relay(upstream_response, exchange, message)
 
-    async def _forward_bodiless(
-        self, request: Request, upstream_name: str, upstream: UpstreamConfig
-    ) -> Response:
+    async def _forward_bodiless(self, request: Request, route: _Route) -> Response:
         """GET opens a server-initiated event stream (handshake era); DELETE ends a session."""
-        exchange = Exchange(
-            upstream=upstream_name,
-            http_method=request.method,
-            headers=request.headers,
-            protocol_version=request.headers.get("mcp-protocol-version"),
-            session_id=request.headers.get("mcp-session-id"),
-        )
+        exchange = route.exchange(request, request.headers.get("mcp-protocol-version"))
         upstream_request = self._http.build_request(
             request.method,
-            str(upstream.url),
-            headers=upstream_request_headers(_latin1_pairs(request.headers.raw), upstream.headers),
-            timeout=self._timeout(upstream, stream=request.method == "GET"),
+            str(route.upstream.url),
+            headers=self._upstream_headers(request, route),
+            timeout=self._timeout(route.upstream, stream=request.method == "GET"),
         )
-        upstream_response = await self._send(upstream_request, upstream_name, None)
+        upstream_response = await self._send(upstream_request, route.name, None)
         if isinstance(upstream_response, Response):
             return upstream_response
         return await self._relay(upstream_response, exchange, None)
@@ -242,7 +314,7 @@ class StreamableHttpProxy:
         self, upstream_response: httpx2.Response, exchange: Exchange, request_message: Message | None
     ) -> Response:
         status = upstream_response.status_code
-        headers = client_response_headers(upstream_response.headers.multi_items())
+        headers = self._client_headers(upstream_response, exchange)
         media_type = _media_type(upstream_response.headers.get("content-type"))
         request_id = request_message.id if request_message is not None else None
 

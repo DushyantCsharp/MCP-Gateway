@@ -3,6 +3,17 @@ server:
   host: 0.0.0.0
   port: 8000
 
+# Every request needs a bearer token. The demo's stand-in identity provider
+# signs them with a shared secret; point jwks_url at a real issuer instead.
+auth:
+  jwt:
+    audience: mcp-customs
+    secret: ${CUSTOMS_JWT_SECRET}
+
+stages:
+  - type: policy
+    file: policy.yaml
+
 upstreams:
   workspace:
     url: http://workspace:8001/mcp
