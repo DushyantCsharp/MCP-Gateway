@@ -255,6 +255,7 @@ def main() -> None:
         type=Path,
         help="reuse the scores in an earlier results JSON instead of running the detector",
     )
+    parser.add_argument("--force", action="store_true", help="replace an existing results file")
     args = parser.parse_args()
 
     attacks = list(read_jsonl(DATASETS / "build" / "attack.jsonl"))
@@ -273,15 +274,17 @@ def main() -> None:
         detector_name = env["detector"]
     else:
         detector = make_detector(args.detector, args.threads)
+        env = environment(detector)  # before scoring: the code state recorded is the code that runs
         print(
             f"scoring {len(attacks)} attack and {len(benign)} benign samples with {detector.name}", flush=True
         )
         scored_attacks, scored_benign = score(detector, attacks), score(detector, benign)
-        env = environment(detector)
         detector_name = detector.name
 
     args.out.mkdir(parents=True, exist_ok=True)
-    stem = f"detection-{env['date'][:10]}-{detector_name}"
+    stem = f"detection-v{env['data'].get('version', 1)}-{env['date'][:10]}-{detector_name}"
+    if (args.out / f"{stem}.md").exists() and not args.force:
+        raise SystemExit(f"{args.out / stem}.md exists; pass --force to replace a published result")
     (args.out / f"{stem}.md").write_text(markdown(env, args.threshold, scored_attacks, scored_benign))
     payload = {
         "environment": env,
