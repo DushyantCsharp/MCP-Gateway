@@ -4,11 +4,13 @@ A security and governance gateway for MCP. It sits between an agent and its
 MCP servers and inspects every message in both directions: what goes out,
 what comes back, and what should not cross at all.
 
-> **Status: pre-release, identity and policy.** With authentication and a
-> policy configured, every request is authenticated and every tool call is
-> checked against the policy, in both MCP protocol eras. Injection detection, redaction, approvals, budgets and
-> audit land over the coming milestones (see the [roadmap](#roadmap)). Until
-> then the gateway does not inspect tool results for injected instructions.
+> **Status: pre-release: identity, policy, audit and tracing.** With them
+> configured, every request is authenticated, every tool call is checked
+> against a policy and recorded in a hash-chained audit log before it runs,
+> and every exchange is traced, in both MCP protocol eras. Injection
+> detection, redaction, approvals and budgets land over the coming milestones
+> (see the [roadmap](#roadmap)). Until then the gateway does not inspect tool
+> results for injected instructions.
 >
 > Benchmark results (detection rate, false-positive rate, latency overhead,
 > and attack success rate with the gateway off vs on) will lead this README
@@ -22,6 +24,8 @@ Requires Docker.
 docker compose -f demo/compose.yaml up --build --wait
 docker compose -f demo/compose.yaml run --rm agent                            # TASK COMPLETE
 docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent  # TASK BLOCKED
+docker compose -f demo/compose.yaml exec gateway customs verify-audit --key-env CUSTOMS_AUDIT_KEY
+open http://localhost:16686                                                   # the traces, in Jaeger
 ```
 
 This starts two sample MCP servers (`workspace`: documents and email;
@@ -35,8 +39,12 @@ the agent reads why. To try other identities, add
 `-e MCP_BEARER_TOKEN_FILE=/tokens/auditor.jwt` (read-only) or
 `/tokens/intruder.jwt` (sees no tools at all).
 
-If ports 8000 to 8002 are taken, set `CUSTOMS_PORT`, `WORKSPACE_PORT` or
-`FINANCE_PORT`.
+Every call, including the blocked payment and the refused token, is in the
+audit log, which `verify-audit` re-hashes end to end. Every call also has a
+trace in Jaeger, with a span per pipeline stage.
+
+If ports 8000 to 8002 or 16686 are taken, set `CUSTOMS_PORT`,
+`WORKSPACE_PORT`, `FINANCE_PORT` or `JAEGER_PORT`.
 
 ## Drop-in
 
@@ -113,6 +121,26 @@ calls blocked, 11 of 11 allowed calls delivered), plus 300 fuzzed transfers per
 run, against an independent restatement of the policy. See the
 [policy reference](docs/policy-reference.md).
 
+## Audit and tracing
+
+- **Recorded before it runs.** A call's audit row commits before the call is
+  forwarded. If the log cannot be written, the call is refused (503), not
+  run unaudited. Writes are batched into shared commits, so durability costs
+  about one round trip per batch rather than per call.
+- **Tamper-evident, not a ledger.** Each row hashes the previous one
+  (HMAC-SHA256 with a key), triggers refuse `UPDATE`, `DELETE` and `TRUNCATE`,
+  and `customs verify-audit` reports the first broken link. Someone with
+  database access and the key can still rewrite history consistently;
+  [architecture](docs/architecture.md#audit) says exactly what this does and
+  does not protect against.
+- **Private by default.** Arguments are recorded as a SHA-256 digest unless
+  you opt in.
+- **One trace per call** with MCP and GenAI semantic-convention attributes,
+  a span per pipeline stage and one for the upstream, joined to the agent's
+  trace through `_meta.traceparent`. Audit rows carry the trace id.
+- **Loud about gaps.** At start-up the gateway logs what it enforces, and
+  warns if authentication, policy or audit is off.
+
 ## What the gateway guarantees on the wire
 
 With or without stages configured:
@@ -155,17 +183,20 @@ response framing.
 | `src/mcp_customs/auth/` | JWT verification, identities and scope grants, session binding |
 | `src/mcp_customs/policy/` | policy file model, rules engine, request targets |
 | `src/mcp_customs/pipeline/` | stage interface, pipeline, policy stage, version-aware replies |
+| `src/mcp_customs/audit/` | hash chain, Postgres store, group-commit writer, verification |
+| `src/mcp_customs/telemetry/` | OpenTelemetry set-up and trace-context handling |
 | `src/mcp_customs/jsonrpc.py` | strict JSON-RPC parsing |
 | `policies/examples/` | finance, read-only and coding agent policies |
 | `demo/` | sample MCP servers, scripted agent, stand-in identity provider, Compose stack |
-| `tests/contract/` | real-client tests through a running gateway, including policy enforcement |
+| `tests/contract/` | real-client tests through a running gateway: policy enforcement, audit, traces |
+| `bench/` | latency harness, methodology and committed results |
 | `docs/` | architecture, policy reference, build notes (what we found, milestone by milestone) |
 
 ## Roadmap
 
 - [x] **Pass-through proxy:** both transport eras, contract tests, CI, Compose demo
 - [x] **Identity and policy:** JWT identity and task scopes, bound sessions, YAML policy with argument constraints
-- [ ] **Audit and telemetry:** hash-chained audit log with `verify-audit`, OpenTelemetry spans, first latency numbers
+- [x] **Audit and telemetry:** hash-chained audit log with `verify-audit`, OpenTelemetry spans, first latency numbers
 - [ ] **Injection detection, layer one:** rules on tool output, attack and benign datasets, per-category results
 - [ ] **Classifier and data protection:** open-source classifier layer, PII and secret redaction
 - [ ] **Approvals and budgets:** held calls in Postgres, approve/deny page, per-agent rate and cost limits

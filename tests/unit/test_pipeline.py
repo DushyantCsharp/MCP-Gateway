@@ -78,7 +78,7 @@ async def test_respond_stops_the_pipeline() -> None:
     log: list[str] = []
     reply = {"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": "no"}}
     pipeline = Pipeline([Recorder("one", log, Respond(reply)), Recorder("two", log)])
-    assert await pipeline.client_message(client_ctx()) == Respond(reply)
+    assert await pipeline.client_message(client_ctx()) == Respond(reply, stage="stage")
     assert log == ["one:a"]
 
 

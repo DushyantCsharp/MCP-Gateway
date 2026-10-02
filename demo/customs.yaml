@@ -14,6 +14,17 @@ stages:
   - type: policy
     file: policy.yaml
 
+# Every call, its decision and its outcome, hash-chained in Postgres.
+# Verify with: docker compose -f demo/compose.yaml exec gateway customs verify-audit --key-env CUSTOMS_AUDIT_KEY
+audit:
+  dsn: ${CUSTOMS_AUDIT_DSN}
+  chain: demo-gateway        # name each gateway replica; the default (host name) changes when a container is recreated
+  key: ${CUSTOMS_AUDIT_KEY}
+
+# Traces in Jaeger: http://localhost:16686
+telemetry:
+  otlp_endpoint: http://jaeger:4318
+
 upstreams:
   workspace:
     url: http://workspace:8001/mcp

@@ -57,6 +57,23 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - run: uv run pytest --cov --cov-report=term --cov-fail-under=90
+        env:
+          CUSTOMS_REQUIRE_POSTGRES: "1"  # audit tests use a Postgres container; never skip them here
+
+  latency:
+    name: Latency smoke
+    runs-on: ubuntu-24.04
+    needs: [test]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      # Shared runners are noisy: this catches gross regressions, not small ones.
+      # The published numbers come from full runs on stated hardware (bench/results/).
+      - run: uv run python bench/harness/latency.py --smoke --check 25
 
   demo:
     name: Demo stack end to end
@@ -78,6 +95,10 @@ jobs:
             echo "expected the payment to be blocked (exit 3), got exit $status"
             exit 1
           fi
+      - name: Every call left a verifiable audit row
+        run: docker compose -f demo/compose.yaml exec -T gateway customs verify-audit --key-env CUSTOMS_AUDIT_KEY
+      - name: Every call left a trace in Jaeger
+        run: python3 demo/scripts/check_traces.py
       - name: Stack logs
         if: failure()
         run: docker compose -f demo/compose.yaml logs

@@ -16,12 +16,17 @@ stage changes them. What the proxy does insist on:
 * every upstream message it relays is strictly valid JSON-RPC, and answers on
   a POST answer that POST's request;
 * a failing upstream or stage is reported to the client as a JSON-RPC error,
-  so a caller is never left waiting on a request that went nowhere.
+  so a caller is never left waiting on a request that went nowhere;
+* a request the audit log cannot record (when it is durable) is refused,
+  not forwarded.
+
+Every exchange is observed (:mod:`mcp_customs.proxy.observe`): it gets a
+server span, and audit events for what was asked, decided and answered.
 """
 
 import logging
 from collections.abc import AsyncIterator, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Final
 
 import anyio
@@ -29,9 +34,11 @@ import httpx2
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 
+from mcp_customs.audit import AuditUnavailableError
 from mcp_customs.auth import AuthError, Identity, JwtAuthenticator, SessionBinder, www_authenticate
 from mcp_customs.config import GatewayConfig, UpstreamConfig
 from mcp_customs.jsonrpc import (
+    AUDIT_UNAVAILABLE,
     HEADER_MISMATCH,
     INTERNAL_ERROR,
     INVALID_REQUEST,
@@ -52,6 +59,7 @@ from mcp_customs.jsonrpc import (
     parse_message,
 )
 from mcp_customs.pipeline.base import (
+    Annotations,
     ClientMessageContext,
     Exchange,
     InvalidReplacementError,
@@ -62,6 +70,7 @@ from mcp_customs.pipeline.base import (
     StageFailedError,
 )
 from mcp_customs.proxy.headers import client_response_headers, upstream_request_headers
+from mcp_customs.proxy.observe import Instruments, Observation
 from mcp_customs.proxy.routing import protocol_version_of, routing_header_mismatch
 from mcp_customs.proxy.sse import SseError, SseEvent, SseParser, encode_event
 
@@ -94,8 +103,29 @@ class _Route:
         )
 
 
+@dataclass(slots=True)
+class _Flow:
+    """One exchange on its way back: what was asked, and how it is being observed."""
+
+    exchange: Exchange
+    request: Message | None
+    obs: Observation
+    annotations: Annotations = field(default_factory=dict)
+    """What server-side stages noted about the answer."""
+
+    @property
+    def request_id(self) -> RequestId | None:
+        return self.request.id if self.request is not None else None
+
+
 class _BodyTooLargeError(Exception):
     pass
+
+
+class _UpstreamFailedError(Exception):
+    def __init__(self, status: int, code: int, message: str) -> None:
+        super().__init__(message)
+        self.status, self.code, self.message = status, code, message
 
 
 class _WithheldError(Exception):
@@ -164,17 +194,20 @@ class StreamableHttpProxy:
         *,
         authenticator: JwtAuthenticator | None = None,
         sessions: SessionBinder | None = None,
+        instruments: Instruments | None = None,
     ) -> None:
         self._config = config
         self._http = http
         self._pipeline = pipeline
         self._authenticator = authenticator
         self._sessions = sessions
+        self._instruments = instruments or Instruments.none()
 
     async def handle(self, request: Request, upstream_name: str) -> Response:
+        obs = self._instruments.begin(request, upstream_name)
         origin = request.headers.get("origin")
         if origin is not None and origin not in self._config.security.allowed_origins:
-            return error_response(403, None, INVALID_REQUEST, "Origin not allowed")
+            return await _rejected(obs, error_response(403, None, INVALID_REQUEST, "Origin not allowed"))
 
         # Authenticate before revealing anything, including which upstreams exist.
         identity: Identity | None = None
@@ -182,11 +215,13 @@ class StreamableHttpProxy:
             try:
                 identity = await self._authenticator.authenticate(request.headers.get("authorization"))
             except AuthError as exc:
-                return self._unauthenticated(exc)
+                return await _rejected(obs, self._unauthenticated(exc), f"authentication: {exc.description}")
+        obs.identified(identity)
 
         upstream = self._config.upstreams.get(upstream_name)
         if upstream is None:
-            return error_response(404, None, INVALID_REQUEST, f"Unknown upstream {upstream_name!r}")
+            response = error_response(404, None, INVALID_REQUEST, f"Unknown upstream {upstream_name!r}")
+            return await _rejected(obs, response)
 
         session_id = request.headers.get(SESSION_HEADER)
         if session_id is not None and self._sessions is not None and identity is not None:
@@ -195,12 +230,13 @@ class StreamableHttpProxy:
                 # 404 is what the spec prescribes for an unknown session: a client
                 # whose session predates a key change starts a new one, and a
                 # caller holding someone else's id learns nothing.
-                return error_response(404, None, SESSION_NOT_FOUND, "Session not found")
+                response = error_response(404, None, SESSION_NOT_FOUND, "Session not found")
+                return await _rejected(obs, response, "session not bound to this agent")
 
         route = _Route(upstream_name, upstream, identity, session_id)
         if request.method == "POST":
-            return await self._post(request, route)
-        return await self._forward_bodiless(request, route)
+            return await self._post(request, route, obs)
+        return await self._forward_bodiless(request, route, obs)
 
     def _unauthenticated(self, exc: AuthError) -> Response:
         response = error_response(exc.status, None, UNAUTHENTICATED, exc.description)
@@ -210,10 +246,12 @@ class StreamableHttpProxy:
             response.headers["www-authenticate"] = challenge
         return response
 
-    def _upstream_headers(self, request: Request, route: _Route) -> list[tuple[str, str]]:
+    def _upstream_headers(self, request: Request, route: _Route, obs: Observation) -> list[tuple[str, str]]:
         headers = upstream_request_headers(_latin1_pairs(request.headers.raw), route.upstream.headers)
         if request.headers.get(SESSION_HEADER) is not None:
             headers = _set_header(headers, SESSION_HEADER, route.session_id)
+        for name, value in obs.upstream_headers().items():
+            headers = _set_header(headers, name, value)
         return headers
 
     def _client_headers(
@@ -228,63 +266,88 @@ class StreamableHttpProxy:
 
     # -- client to server ------------------------------------------------------------------------
 
-    async def _post(self, request: Request, route: _Route) -> Response:
+    async def _post(self, request: Request, route: _Route, obs: Observation) -> Response:
         try:
             body = await _read_request_body(request, self._config.limits.max_request_bytes)
         except _BodyTooLargeError:
-            return error_response(413, None, INVALID_REQUEST, "Request body too large")
+            return await _rejected(obs, error_response(413, None, INVALID_REQUEST, "Request body too large"))
         try:
             message = parse_message(body)
         except JsonRpcError as exc:
-            return error_response(400, exc.request_id, exc.code, exc.message)
+            return await _rejected(
+                obs, error_response(400, exc.request_id, exc.code, exc.message), exc.message
+            )
 
         raw_headers = _latin1_pairs(request.headers.raw)
         if (mismatch := routing_header_mismatch(message, request.headers, raw_headers)) is not None:
-            return error_response(400, message.id, HEADER_MISMATCH, mismatch)
+            return await _rejected(obs, error_response(400, message.id, HEADER_MISMATCH, mismatch), mismatch)
 
         exchange = route.exchange(request, protocol_version_of(message, request.headers))
+        obs.parsed(message, exchange)
+        ctx = ClientMessageContext(exchange, message)
         if self._pipeline:
             try:
-                outcome = await self._pipeline.client_message(ClientMessageContext(exchange, message))
+                with obs.active():
+                    outcome = await self._pipeline.client_message(ctx)
             except (StageFailedError, InvalidReplacementError, JsonRpcError):
                 logger.exception("pipeline failed on %s to %s; not forwarded", message.method, route.name)
-                return error_response(500, message.id, INTERNAL_ERROR, "Gateway pipeline error")
+                error = error_object(message.id, INTERNAL_ERROR, "Gateway pipeline error")
+                await obs.stopped("error", error, None, ctx.annotations, "gateway pipeline error")
+                return await _answered(obs, 500, error, "gateway pipeline error")
             match outcome:
-                case Respond(message=reply):
-                    if message.is_request:
-                        return Response(dumps(reply), media_type=JSON_MEDIA_TYPE)
-                    return Response(status_code=202)
+                case Respond(message=reply, stage=stage):
+                    await obs.stopped("denied", reply, stage, ctx.annotations, f"answered by {stage}")
+                    if not message.is_request:
+                        await obs.finish(202)
+                        return Response(status_code=202)
+                    await obs.finish(200)
+                    return Response(dumps(reply), media_type=JSON_MEDIA_TYPE)
                 case Replace(message=replacement):
                     message = Message(replacement, message.kind)
                     body = dumps(replacement)
                 case _:
                     pass
 
+        try:
+            await obs.forwarding(ctx.annotations)
+        except AuditUnavailableError:
+            logger.error("audit log unavailable; refused %s to %s", message.method, route.name)  # noqa: TRY400
+            error = error_object(
+                message.id, AUDIT_UNAVAILABLE, "Audit log unavailable; the call was not made"
+            )
+            return await _answered(obs, 503, error, "audit log unavailable")
+
         upstream_request = self._http.build_request(
             "POST",
             str(route.upstream.url),
-            headers=self._upstream_headers(request, route),
+            headers=self._upstream_headers(request, route, obs),
             content=body,
             timeout=self._timeout(route.upstream, stream=False),
         )
-        upstream_response = await self._send(upstream_request, route.name, message.id)
-        if isinstance(upstream_response, Response):
-            return upstream_response
-        return await self._relay(upstream_response, exchange, message)
+        flow = _Flow(exchange, message, obs)
+        try:
+            upstream_response = await self._send(upstream_request, route.name)
+        except _UpstreamFailedError as exc:
+            return await _answered(
+                obs, exc.status, error_object(message.id, exc.code, exc.message), exc.message
+            )
+        return await self._relay(upstream_response, flow)
 
-    async def _forward_bodiless(self, request: Request, route: _Route) -> Response:
+    async def _forward_bodiless(self, request: Request, route: _Route, obs: Observation) -> Response:
         """GET opens a server-initiated event stream (handshake era); DELETE ends a session."""
         exchange = route.exchange(request, request.headers.get("mcp-protocol-version"))
+        obs.transport()
         upstream_request = self._http.build_request(
             request.method,
             str(route.upstream.url),
-            headers=self._upstream_headers(request, route),
+            headers=self._upstream_headers(request, route, obs),
             timeout=self._timeout(route.upstream, stream=request.method == "GET"),
         )
-        upstream_response = await self._send(upstream_request, route.name, None)
-        if isinstance(upstream_response, Response):
-            return upstream_response
-        return await self._relay(upstream_response, exchange, None)
+        try:
+            upstream_response = await self._send(upstream_request, route.name)
+        except _UpstreamFailedError as exc:
+            return await _answered(obs, exc.status, error_object(None, exc.code, exc.message), exc.message)
+        return await self._relay(upstream_response, _Flow(exchange, None, obs))
 
     def _timeout(self, upstream: UpstreamConfig, *, stream: bool) -> httpx2.Timeout:
         return httpx2.Timeout(
@@ -294,139 +357,146 @@ class StreamableHttpProxy:
             pool=upstream.connect_timeout_s,
         )
 
-    async def _send(
-        self, upstream_request: httpx2.Request, upstream_name: str, request_id: RequestId | None
-    ) -> httpx2.Response | Response:
+    async def _send(self, upstream_request: httpx2.Request, upstream_name: str) -> httpx2.Response:
         try:
             return await self._http.send(upstream_request, stream=True, follow_redirects=False)
-        except httpx2.TimeoutException:
+        except httpx2.TimeoutException as exc:
             logger.warning("upstream %s timed out", upstream_name)
-            return error_response(504, request_id, UPSTREAM_TIMEOUT, f"Upstream {upstream_name!r} timed out")
+            raise _UpstreamFailedError(
+                504, UPSTREAM_TIMEOUT, f"Upstream {upstream_name!r} timed out"
+            ) from exc
         except httpx2.TransportError as exc:
             logger.warning("upstream %s unavailable: %s", upstream_name, exc)
-            return error_response(
-                502, request_id, UPSTREAM_UNAVAILABLE, f"Upstream {upstream_name!r} unavailable"
-            )
+            message = f"Upstream {upstream_name!r} unavailable"
+            raise _UpstreamFailedError(502, UPSTREAM_UNAVAILABLE, message) from exc
 
     # -- server to client ------------------------------------------------------------------------
 
-    async def _relay(
-        self, upstream_response: httpx2.Response, exchange: Exchange, request_message: Message | None
-    ) -> Response:
+    async def _relay(self, upstream_response: httpx2.Response, flow: _Flow) -> Response:
         status = upstream_response.status_code
-        headers = self._client_headers(upstream_response, exchange)
+        flow.obs.upstream_responded(status)
+        headers = self._client_headers(upstream_response, flow.exchange)
         media_type = _media_type(upstream_response.headers.get("content-type"))
-        request_id = request_message.id if request_message is not None else None
 
         if media_type == SSE_MEDIA_TYPE:
-            events = self._relay_sse(upstream_response, exchange, request_message)
+            events = self._relay_sse(upstream_response, flow, status)
             return _with_headers(StreamingResponse(events, status_code=status), headers)
 
         try:
             content = await _read_upstream_body(upstream_response, self._config.limits.max_response_bytes)
         except _BodyTooLargeError:
-            return error_response(502, request_id, UPSTREAM_BAD_RESPONSE, "Upstream response too large")
+            return await self._failed(flow, 502, UPSTREAM_BAD_RESPONSE, "Upstream response too large")
         except httpx2.TransportError:
-            return error_response(502, request_id, UPSTREAM_UNAVAILABLE, "Upstream closed the connection")
+            return await self._failed(flow, 502, UPSTREAM_UNAVAILABLE, "Upstream closed the connection")
         finally:
             await _close_quietly(upstream_response)
 
         if media_type == JSON_MEDIA_TYPE and content:
-            inspected = await self._inspect_json_body(content, status, exchange, request_message)
+            inspected = await self._inspect_json_body(content, status, flow)
             if isinstance(inspected, Response):
                 return inspected
             content = inspected
+        await flow.obs.finish(status, annotations=flow.annotations)
         return _with_headers(Response(content, status_code=status), headers)
 
-    async def _inspect_json_body(
-        self, content: bytes, status: int, exchange: Exchange, request_message: Message | None
-    ) -> bytes | Response:
-        request_id = request_message.id if request_message is not None else None
+    async def _failed(self, flow: _Flow, status: int, code: int, message: str) -> Response:
+        return await _answered(
+            flow.obs, status, error_object(flow.request_id, code, message), message, flow.annotations
+        )
+
+    async def _inspect_json_body(self, content: bytes, status: int, flow: _Flow) -> bytes | Response:
+        upstream = flow.exchange.upstream
         try:
             decoded = loads_strict(content)
         except JsonRpcError:
-            logger.warning("upstream %s sent invalid JSON (HTTP %d)", exchange.upstream, status)
-            return error_response(502, request_id, UPSTREAM_BAD_RESPONSE, "Upstream sent invalid JSON")
+            logger.warning("upstream %s sent invalid JSON (HTTP %d)", upstream, status)
+            return await self._failed(flow, 502, UPSTREAM_BAD_RESPONSE, "Upstream sent invalid JSON")
         try:
             message = classify(decoded)
         except JsonRpcError:
             if status >= 400:
                 return content  # an HTTP-level error document, not a protocol message
-            logger.warning("upstream %s sent a non-JSON-RPC body: %.200r", exchange.upstream, decoded)
-            return error_response(502, request_id, UPSTREAM_BAD_RESPONSE, "Upstream sent an invalid message")
-        if not self._answers(message, request_message):
-            logger.warning("upstream %s answered a request it was not asked", exchange.upstream)
-            return error_response(
-                502, request_id, UPSTREAM_BAD_RESPONSE, "Upstream answered the wrong request"
-            )
+            logger.warning("upstream %s sent a non-JSON-RPC body: %.200r", upstream, decoded)
+            return await self._failed(flow, 502, UPSTREAM_BAD_RESPONSE, "Upstream sent an invalid message")
+        if not self._answers(message, flow.request):
+            logger.warning("upstream %s answered a request it was not asked", upstream)
+            return await self._failed(flow, 502, UPSTREAM_BAD_RESPONSE, "Upstream answered the wrong request")
         try:
-            replacement = await self._run_server_stages(exchange, message, request_message)
+            replacement = await self._run_server_stages(flow, message)
         except _WithheldError:
-            return error_response(500, request_id, INTERNAL_ERROR, "Gateway pipeline error")
+            return await self._failed(flow, 500, INTERNAL_ERROR, "Gateway pipeline error")
+        flow.obs.answered(replacement if replacement is not None else message.raw)
         return content if replacement is None else dumps(replacement)
 
     async def _relay_sse(
-        self, upstream_response: httpx2.Response, exchange: Exchange, request_message: Message | None
+        self, upstream_response: httpx2.Response, flow: _Flow, status: int
     ) -> AsyncIterator[bytes]:
         parser = SseParser(self._config.limits.max_response_bytes)
-        awaiting_answer = request_message is not None and request_message.is_request
+        awaiting_answer = flow.request is not None and flow.request.is_request
         failure: str | None = None
+        ended_early = True  # until the stream is read to its end, or fails in a way handled below
         try:
             async for chunk in upstream_response.aiter_bytes():
                 for event in parser.feed(chunk):
-                    out, answered = await self._relay_event(event, exchange, request_message)
+                    out, answered = await self._relay_event(event, flow)
                     awaiting_answer = awaiting_answer and not answered
                     if out:
                         yield out
                     elif event.has_data:
                         failure = "Upstream sent an invalid message"
             for event in parser.close():
-                out, _ = await self._relay_event(event, exchange, request_message)
+                out, _ = await self._relay_event(event, flow)
                 if out:
                     yield out
+            ended_early = False
         except SseError as exc:
-            failure = f"Upstream sent an invalid event stream: {exc}"
+            failure, ended_early = f"Upstream sent an invalid event stream: {exc}", False
         except httpx2.TransportError:
-            failure = "Upstream closed the event stream"
+            failure, ended_early = "Upstream closed the event stream", False
         finally:
             await _close_quietly(upstream_response)
+            if ended_early:  # the client went away: cancelled, or the response closed under us
+                with anyio.CancelScope(shield=True):
+                    await flow.obs.finish(status, failure="client disconnected", annotations=flow.annotations)
 
         # A stream may legitimately end before its answer (the client resumes
         # with Last-Event-ID), so an error is synthesised only when something
         # went wrong; otherwise the caller could wait forever for an answer
         # the gateway dropped.
         if failure is not None:
-            logger.warning("upstream %s: %s", exchange.upstream, failure)
-            if awaiting_answer and request_message is not None:
-                error = error_object(request_message.id, UPSTREAM_BAD_RESPONSE, failure)
+            logger.warning("upstream %s: %s", flow.exchange.upstream, failure)
+            if awaiting_answer and flow.request is not None:
+                error = error_object(flow.request.id, UPSTREAM_BAD_RESPONSE, failure)
+                flow.obs.answered(error)
                 yield encode_event(dumps(error).decode("utf-8"), event="message")
+        await flow.obs.finish(status, failure=failure, annotations=flow.annotations)
 
-    async def _relay_event(
-        self, event: SseEvent, exchange: Exchange, request_message: Message | None
-    ) -> tuple[bytes, bool]:
+    async def _relay_event(self, event: SseEvent, flow: _Flow) -> tuple[bytes, bool]:
         """Return the bytes to forward for one event, and whether it answered the request."""
         if event.data is None:
             return event.raw, False
+        upstream = flow.exchange.upstream
         try:
             message = parse_message(event.data)
         except JsonRpcError:
-            logger.warning("dropped an invalid SSE message from upstream %s", exchange.upstream)
+            logger.warning("dropped an invalid SSE message from upstream %s", upstream)
             return b"", False
-        if not self._answers(message, request_message):
-            logger.warning("dropped an answer to a request upstream %s was not asked", exchange.upstream)
+        if not self._answers(message, flow.request):
+            logger.warning("dropped an answer to a request upstream %s was not asked", upstream)
             return b"", False
-        answered = request_message is not None and message.kind in _ANSWER_KINDS
+        answered = flow.request is not None and message.kind in _ANSWER_KINDS
         try:
-            replacement = await self._run_server_stages(exchange, message, request_message)
+            replacement = await self._run_server_stages(flow, message)
         except _WithheldError:
             if message.kind not in _ANSWER_KINDS:
                 return b"", False
             replacement = error_object(message.id, INTERNAL_ERROR, "Gateway pipeline error")
+        if answered:
+            flow.obs.answered(replacement if replacement is not None else message.raw)
         if replacement is None:
             return event.raw, answered
-        return encode_event(
-            dumps(replacement).decode("utf-8"), event=event.event, event_id=event.id
-        ), answered
+        data = dumps(replacement).decode("utf-8")
+        return encode_event(data, event=event.event, event_id=event.id), answered
 
     @staticmethod
     def _answers(message: Message, request_message: Message | None) -> bool:
@@ -441,17 +511,32 @@ class StreamableHttpProxy:
             return True
         return request_message.is_request and message.id == request_message.id
 
-    async def _run_server_stages(
-        self, exchange: Exchange, message: Message, request_message: Message | None
-    ) -> JSONObject | None:
+    async def _run_server_stages(self, flow: _Flow, message: Message) -> JSONObject | None:
         """Return the replacement message, or ``None`` to forward the original."""
         if not self._pipeline:
             return None
+        ctx = ServerMessageContext(flow.exchange, message, flow.request, flow.annotations)
         try:
-            outcome = await self._pipeline.server_message(
-                ServerMessageContext(exchange, message, request_message)
-            )
+            with flow.obs.active():
+                outcome = await self._pipeline.server_message(ctx)
         except (StageFailedError, InvalidReplacementError, JsonRpcError) as exc:
-            logger.exception("pipeline failed on a message from upstream %s; withheld", exchange.upstream)
+            logger.exception(
+                "pipeline failed on a message from upstream %s; withheld", flow.exchange.upstream
+            )
             raise _WithheldError from exc
         return outcome.message if isinstance(outcome, Replace) else None
+
+
+async def _rejected(obs: Observation, response: Response, reason: str | None = None) -> Response:
+    """Record a request refused before it was understood, and return the refusal."""
+    await obs.rejected(response.status_code, reason or bytes(response.body).decode("utf-8", "replace")[:200])
+    return response
+
+
+async def _answered(
+    obs: Observation, status: int, error: JSONObject, failure: str, annotations: Annotations | None = None
+) -> Response:
+    """Answer the client with a gateway error, closing its observation."""
+    obs.answered(error)
+    await obs.finish(status, failure=failure, annotations=annotations)
+    return Response(dumps(error), status_code=status, media_type=JSON_MEDIA_TYPE)

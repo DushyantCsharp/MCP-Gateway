@@ -1,14 +1,17 @@
 # The demo stack: two sample MCP servers, the gateway in front of them with
-# authentication and the example finance policy, and a stand-in identity
-# provider that mints the agents' tokens.
+# authentication and the example finance policy, a stand-in identity provider
+# that mints the agents' tokens, Postgres for the audit log and Jaeger for
+# traces.
 #
 #   docker compose -f demo/compose.yaml up --build --wait
-#   docker compose -f demo/compose.yaml run --rm agent                         # completes
+#   docker compose -f demo/compose.yaml run --rm agent                             # completes
 #   docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent   # blocked by policy
+#   docker compose -f demo/compose.yaml exec gateway customs verify-audit --key-env CUSTOMS_AUDIT_KEY
+#   open http://localhost:16686                                                    # traces
 #
 # The servers are also published on localhost:8001 and :8002, so the same
 # agent can be pointed at them directly to compare. If those ports are taken,
-# set CUSTOMS_PORT, WORKSPACE_PORT or FINANCE_PORT.
+# set CUSTOMS_PORT, WORKSPACE_PORT, FINANCE_PORT or JAEGER_PORT.
 
 name: mcp-customs-demo
 
@@ -29,6 +32,11 @@ x-token-secret: &token-secret
   # verifies tokens from its identity provider instead (auth.jwt.jwks_url).
   CUSTOMS_JWT_SECRET: ${CUSTOMS_JWT_SECRET:-demo-only-secret-never-use-in-production}
 
+x-audit-db: &audit-db
+  POSTGRES_USER: customs
+  POSTGRES_PASSWORD: ${CUSTOMS_DB_PASSWORD:-demo-only-password}
+  POSTGRES_DB: customs
+
 services:
   workspace:
     <<: *demo-image
@@ -46,12 +54,28 @@ services:
       <<: *healthcheck
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/healthz', timeout=2)"]
 
+  postgres:
+    image: postgres:17-alpine
+    environment: *audit-db
+    volumes: ["audit-db:/var/lib/postgresql/data"]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "pg_isready", "-U", "customs", "-d", "customs"]
+
+  jaeger:
+    image: jaegertracing/jaeger:2.21.0
+    ports: ["127.0.0.1:${JAEGER_PORT:-16686}:16686"]
+
   gateway:
     build:
       context: ..
       dockerfile: Dockerfile
     image: mcp-customs:dev
-    environment: *token-secret
+    environment:
+      <<: *token-secret
+      CUSTOMS_AUDIT_DSN: postgresql://customs:${CUSTOMS_DB_PASSWORD:-demo-only-password}@postgres:5432/customs
+      # Demo only: the key that makes the audit chain's hashes unforgeable without it.
+      CUSTOMS_AUDIT_KEY: ${CUSTOMS_AUDIT_KEY:-demo-only-audit-key}
     volumes:
       - ./customs.yaml:/etc/customs/customs.yaml:ro
       - ../policies/examples/finance-agent.yaml:/etc/customs/policy.yaml:ro
@@ -59,6 +83,8 @@ services:
     depends_on:
       workspace: {condition: service_healthy}
       finance: {condition: service_healthy}
+      postgres: {condition: service_healthy}
+      jaeger: {condition: service_started}
 
   issuer:
     <<: *demo-image
@@ -83,3 +109,4 @@ services:
 
 volumes:
   tokens:
+  audit-db:

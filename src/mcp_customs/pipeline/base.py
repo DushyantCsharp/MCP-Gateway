@@ -12,11 +12,18 @@ server-to-client message on the way back, and returns an outcome:
 Stages run in the order they are configured, in both directions. A stage
 that raises fails the message closed: it is not forwarded, and the client
 gets an error in its place.
+
+A stage explains itself by writing ``ctx.annotations[<stage name>]``, a dict
+of scalars (for the policy stage: the decision, rule and reason). The
+gateway copies annotations onto the stage's span and into the audit log.
+Each stage runs inside its own span.
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
-from typing import ClassVar
+from dataclasses import dataclass, field, replace
+from typing import Any, ClassVar
+
+from opentelemetry import trace
 
 from mcp_customs.auth.identity import Identity
 from mcp_customs.jsonrpc import JSONObject, Message, MessageKind, classify
@@ -38,10 +45,15 @@ class Exchange:
     """The authenticated caller; ``None`` when the gateway runs without authentication."""
 
 
+type Annotations = dict[str, dict[str, Any]]
+"""Stage name -> what that stage decided, as scalar values."""
+
+
 @dataclass(frozen=True, slots=True)
 class ClientMessageContext:
     exchange: Exchange
     message: Message
+    annotations: Annotations = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +62,7 @@ class ServerMessageContext:
     message: Message
     request: Message | None
     """The client request this message answers or belongs to; ``None`` on a server-initiated stream."""
+    annotations: Annotations = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +81,8 @@ class Replace:
 @dataclass(frozen=True, slots=True)
 class Respond:
     message: JSONObject
+    stage: str | None = None
+    """Filled in by the pipeline: which stage answered."""
 
 
 type ClientOutcome = Continue | Replace | Respond
@@ -124,9 +139,17 @@ def _check_server_replacement(original: Message, replacement: Message) -> None:
         raise InvalidReplacementError("a replaced server request or notification may only change its params")
 
 
+def _record(span: trace.Span, stage: str, outcome: object, annotations: Annotations) -> None:
+    span.set_attribute("customs.stage.outcome", type(outcome).__name__.lower())
+    for key, value in annotations.get(stage, {}).items():
+        if isinstance(value, str | bool | int | float):
+            span.set_attribute(f"customs.{stage}.{key}", value)
+
+
 class Pipeline:
-    def __init__(self, stages: Sequence[Stage] = ()) -> None:
+    def __init__(self, stages: Sequence[Stage] = (), *, tracer: trace.Tracer | None = None) -> None:
         self._stages = tuple(stages)
+        self.tracer: trace.Tracer = tracer or trace.NoOpTracer()
 
     @property
     def stages(self) -> tuple[Stage, ...]:
@@ -138,13 +161,15 @@ class Pipeline:
     async def client_message(self, ctx: ClientMessageContext) -> ClientOutcome:
         current = ctx
         for stage in self._stages:
-            try:
-                outcome = await stage.on_client_message(current)
-            except Exception as exc:
-                raise StageFailedError(stage.name) from exc
+            with self.tracer.start_as_current_span(f"stage {stage.name}") as span:
+                try:
+                    outcome = await stage.on_client_message(current)
+                except Exception as exc:
+                    raise StageFailedError(stage.name) from exc
+                _record(span, stage.name, outcome, ctx.annotations)
             match outcome:
                 case Respond():
-                    return outcome
+                    return replace(outcome, stage=stage.name)
                 case Replace(message=raw):
                     replacement = classify(raw)
                     _check_client_replacement(ctx.message, replacement)
@@ -155,9 +180,15 @@ class Pipeline:
 
     async def server_message(self, ctx: ServerMessageContext) -> ServerOutcome:
         current = ctx
+        # Answers get spans; the notifications that may stream ahead of them
+        # (progress, logs) would only bury the trace.
+        traced = ctx.message.kind in (MessageKind.RESPONSE, MessageKind.ERROR)
         for stage in self._stages:
+            span = self.tracer.start_span(f"stage {stage.name} (answer)") if traced else trace.INVALID_SPAN
             try:
-                outcome = await stage.on_server_message(current)
+                with trace.use_span(span, end_on_exit=True):
+                    outcome = await stage.on_server_message(current)
+                    _record(span, stage.name, outcome, ctx.annotations)
             except Exception as exc:
                 raise StageFailedError(stage.name) from exc
             if isinstance(outcome, Replace):
