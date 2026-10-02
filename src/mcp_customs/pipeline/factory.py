@@ -2,7 +2,13 @@
 
 from collections.abc import Sequence
 
-from mcp_customs.config import InjectionStageConfig, PolicyStageConfig, RedactionStageConfig, StageConfig
+from mcp_customs.config import (
+    ConfigError,
+    InjectionStageConfig,
+    PolicyStageConfig,
+    RedactionStageConfig,
+    StageConfig,
+)
 from mcp_customs.detectors import Calibrated, Detector
 from mcp_customs.detectors.hidden import HiddenTextDetector, LayeredDetector
 from mcp_customs.detectors.sensitive import SensitiveScanner
@@ -23,7 +29,17 @@ def build_stage(config: StageConfig) -> Stage:
                 from mcp_customs.detectors.classifier import OnnxClassifier
 
                 classifier = OnnxClassifier(threads=1, max_chars=config.max_chars)
-                classifier.load()  # downloads the model on first start, and fails fast if it cannot
+                try:
+                    classifier.load()  # downloads the model on first start, and fails fast if it cannot
+                except ImportError as exc:
+                    raise ConfigError(
+                        f"the {config.detector!r} injection detector needs the classifier extra "
+                        "(pip install 'mcp-customs[classifier]'); detector: hidden needs nothing"
+                    ) from exc
+                except Exception as exc:  # a download or model error, at start-up only
+                    raise ConfigError(
+                        f"cannot load the injection classifier {classifier.model}: {exc}"
+                    ) from exc
                 calibrated = Calibrated(classifier, config.classifier_threshold)
                 detector = (
                     calibrated if config.detector == "classifier" else LayeredDetector([detector, calibrated])
