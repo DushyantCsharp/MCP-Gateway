@@ -1,0 +1,41 @@
+{
+  "attack": {
+    "by_category_variant_split": {
+      "exfiltration/base/dev": 459,
+      "exfiltration/base/test": 85,
+      "exfiltration/enhanced/dev": 459,
+      "exfiltration/enhanced/test": 85,
+      "tool_hijack/base/dev": 323,
+      "tool_hijack/base/test": 187,
+      "tool_hijack/enhanced/dev": 323,
+      "tool_hijack/enhanced/test": 187
+    },
+    "groups": 62,
+    "total": 2108
+  },
+  "benign": {
+    "by_category_variant_split": {
+      "code/default/dev": 70,
+      "code/default/test": 8,
+      "long_outputs/default/dev": 63,
+      "long_outputs/default/test": 27,
+      "paired/default/dev": 140,
+      "paired/default/test": 30,
+      "security_docs/default/dev": 67,
+      "security_docs/default/test": 35
+    },
+    "groups": 129,
+    "total": 440
+  },
+  "built": "2026-10-02",
+  "files": {
+    "attack.jsonl": "6c7b116814b263def704184f700616b972b1319916a63fee74ce7836cc16699a",
+    "benign.jsonl": "bc40ebfa515fc6afc45d6782d8f241c2baa9f3970f3a2d4548c73c44c7048e7d"
+  },
+  "inputs": {
+    "fill_in_sha256": "c7e04efeb6029d0e4528b4b52a3a35d081b1977c8e293dfa36c166fb0c6de9e6",
+    "injecagent_commit": "f19c9f2c79a41046eb13c03c51a24c567a8ffa07",
+    "python_stdlib": "3.12.13",
+    "seed": 20261002
+  }
+}
