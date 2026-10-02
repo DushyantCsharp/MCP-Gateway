@@ -36,6 +36,8 @@ from mcp_types import CallToolResult, TextContent
 
 AP_MAILBOX = "ap@acme.example"
 POLICY_BLOCK_PREFIX = "Blocked by gateway policy"
+# Where a gateway with a redaction stage says what it removed from a result.
+REDACTION_META_KEY = "io.github.mcp-customs/redaction"
 EXIT_BLOCKED = 3
 
 type Task = Literal["summary", "pay-invoice"]
@@ -56,6 +58,7 @@ class TaskReport:
     available: Decimal
     email_message_id: str | None = None
     transfer_id: str | None = None
+    redacted: list[str] = field(default_factory=list)
     steps: list[str] = field(default_factory=list)
 
 
@@ -148,14 +151,17 @@ async def _run_task(
         if amount_match is None:
             raise TaskFailedError("invoice has no amount due")
         amount_due = Decimal(amount_match.group(1))
-        steps.append(f"read_doc -> amount due {amount_due}")
+        finding = (read.meta or {}).get(REDACTION_META_KEY, {})
+        redacted = list(finding.get("kinds", [])) if finding.get("action") == "redact" else []
+        note = f" (gateway redacted: {', '.join(redacted)})" if redacted else ""
+        steps.append(f"read_doc -> amount due {amount_due}{note}")
 
         balance = _structured(
             await finance.call_tool("get_balance", {"account_id": "ACC-OPERATING"}), "balance check"
         )
         available = Decimal(balance["available"])
         steps.append(f"get_balance -> {available} available")
-        report = TaskReport(invoice_id, amount_due, available, steps=steps)
+        report = TaskReport(invoice_id, amount_due, available, redacted=redacted, steps=steps)
 
         if task == "pay-invoice":
             arguments = {

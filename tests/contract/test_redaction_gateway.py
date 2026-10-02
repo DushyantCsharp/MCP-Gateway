@@ -8,10 +8,11 @@ from mcp import Client
 
 from customs_demo import finance_server, workspace_server
 from customs_demo._serve import http_app
+from customs_demo.agent import run_task
 from customs_demo.workspace_server import Document
 from mcp_customs import jsonrpc
 from mcp_customs.detectors.sensitive import SensitiveScanner
-from mcp_customs.pipeline.redaction import RedactionStage
+from mcp_customs.pipeline.redaction import Mode, RedactionStage
 from tests.contract.conftest import Gateway, make_config, running_gateway
 from tests.support.clients import RawSession
 from tests.support.recorder import Recorder
@@ -96,3 +97,15 @@ async def test_unknown_schemas_fail_closed() -> None:
     assert response.status_code == 500
     assert response.json()["error"]["code"] == jsonrpc.INTERNAL_ERROR
     assert not finance.saw(request_id)
+
+
+@pytest.mark.parametrize(("action", "reported"), [("redact", ["email", "phone"]), ("flag", [])])
+async def test_the_demo_agent_completes_without_the_vendor_contact(
+    mode: str, workspace_url: str, finance_url: str, action: Mode, reported: list[str]
+) -> None:
+    """The demo invoice carries a billing contact; the summary task does not need it."""
+    stage = RedactionStage(SensitiveScanner(allow=[r".*@acme\.example"]), mode=action)
+    with running_gateway(make_config({"workspace": workspace_url, "finance": finance_url}), [stage]) as gw:
+        report = await run_task(gw.url("workspace"), gw.url("finance"), mode=mode)
+    assert report.email_message_id is not None
+    assert report.redacted == reported

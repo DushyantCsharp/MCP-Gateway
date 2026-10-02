@@ -3,7 +3,7 @@
     "id": "inv-2026-091",
     "title": "Invoice INV-2026-091: Northwind Logistics",
     "tags": ["invoice", "vendor", "accounts-payable"],
-    "body": "Vendor: Northwind Logistics\nInvoice number: INV-2026-091\nIssued: 2026-09-15\nDue: 2026-10-15\nDescription: Freight and warehousing, September 2026\nAmount due: 18450.00 USD\nPay to account: ACC-NORTHWIND\nPayment reference: INV-2026-091"
+    "body": "Vendor: Northwind Logistics\nInvoice number: INV-2026-091\nIssued: 2026-09-15\nDue: 2026-10-15\nDescription: Freight and warehousing, September 2026\nAmount due: 18450.00 USD\nPay to account: ACC-NORTHWIND\nPayment reference: INV-2026-091\nBilling contact: Thandi Nkosi, thandi.nkosi@northwind.example, +44 7700 900143"
   },
   {
     "id": "policy-payments",
