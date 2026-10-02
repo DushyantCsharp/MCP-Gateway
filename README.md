@@ -141,6 +141,25 @@ run, against an independent restatement of the policy. See the
 - **Loud about gaps.** At start-up the gateway logs what it enforces, and
   warns if authentication, policy or audit is off.
 
+## Performance
+
+What the gateway adds to a `tools/call` (Apple M4, one gateway process;
+[full results and method](bench/README.md)):
+
+| With one client | p50 added | p99 added |
+| --- | ---: | ---: |
+| pass-through | +0.40 ms | noise* |
+| + JWT auth and policy | +0.47 ms | noise* |
+| + durable audit and tracing | +1.57 ms | +7.1 ms |
+
+\*Below the direct baseline's own p99 variation in this run.
+
+One gateway process tops out at about 1,000 to 1,500 calls a second, below
+the roughly 3,500 of the MCP server behind it, so at 10 or more concurrent
+clients queueing in the gateway dominates. The cost is the pure-Python HTTP
+client, not policy or parsing; scaling out, and a faster client, are on the
+roadmap.
+
 ## What the gateway guarantees on the wire
 
 With or without stages configured:

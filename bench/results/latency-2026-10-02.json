@@ -1,0 +1,166 @@
+{
+  "environment": {
+    "date": "2026-10-02T20:43:32+00:00",
+    "commit": "0a7f95f",
+    "cpu": "Apple M4",
+    "cores": 10,
+    "memory_gb": 16.0,
+    "os": "macOS-15.7.4-arm64-arm-64bit",
+    "load_average_1m": 3.3,
+    "python": "3.12.13",
+    "versions": {
+      "mcp-customs": "0.0.1",
+      "mcp": "2.2.0",
+      "uvicorn": "0.54.0",
+      "httpx2": "2.13.1",
+      "fastapi": "0.142.2",
+      "psycopg": "3.3.6"
+    }
+  },
+  "results": [
+    {
+      "variant": "direct",
+      "concurrency": 1,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 0.545,
+      "p90_ms": 0.61,
+      "p99_ms": 1.605,
+      "max_ms": 12.46,
+      "mean_ms": 0.592,
+      "throughput_rps": 1620.1
+    },
+    {
+      "variant": "direct",
+      "concurrency": 10,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 2.491,
+      "p90_ms": 3.221,
+      "p99_ms": 4.424,
+      "max_ms": 13.3,
+      "mean_ms": 2.653,
+      "throughput_rps": 3746.9
+    },
+    {
+      "variant": "direct",
+      "concurrency": 50,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 12.857,
+      "p90_ms": 16.865,
+      "p99_ms": 24.074,
+      "max_ms": 25.726,
+      "mean_ms": 14.168,
+      "throughput_rps": 3425.9
+    },
+    {
+      "variant": "passthrough",
+      "concurrency": 1,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 0.948,
+      "p90_ms": 1.011,
+      "p99_ms": 1.18,
+      "max_ms": 10.604,
+      "mean_ms": 0.961,
+      "throughput_rps": 1028.1
+    },
+    {
+      "variant": "passthrough",
+      "concurrency": 10,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 5.713,
+      "p90_ms": 7.23,
+      "p99_ms": 25.52,
+      "max_ms": 39.847,
+      "mean_ms": 6.228,
+      "throughput_rps": 1504.5
+    },
+    {
+      "variant": "passthrough",
+      "concurrency": 50,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 46.483,
+      "p90_ms": 59.795,
+      "p99_ms": 122.229,
+      "max_ms": 136.982,
+      "mean_ms": 48.626,
+      "throughput_rps": 1036.2
+    },
+    {
+      "variant": "policy",
+      "concurrency": 1,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 1.014,
+      "p90_ms": 1.08,
+      "p99_ms": 1.298,
+      "max_ms": 2.534,
+      "mean_ms": 1.026,
+      "throughput_rps": 956.8
+    },
+    {
+      "variant": "policy",
+      "concurrency": 10,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 6.666,
+      "p90_ms": 10.395,
+      "p99_ms": 26.273,
+      "max_ms": 49.639,
+      "mean_ms": 7.524,
+      "throughput_rps": 1341.5
+    },
+    {
+      "variant": "policy",
+      "concurrency": 50,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 49.502,
+      "p90_ms": 63.06,
+      "p99_ms": 83.583,
+      "max_ms": 93.171,
+      "mean_ms": 50.446,
+      "throughput_rps": 997.8
+    },
+    {
+      "variant": "full",
+      "concurrency": 1,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 2.118,
+      "p90_ms": 2.918,
+      "p99_ms": 8.733,
+      "max_ms": 38.08,
+      "mean_ms": 2.415,
+      "throughput_rps": 410.6
+    },
+    {
+      "variant": "full",
+      "concurrency": 10,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 11.049,
+      "p90_ms": 15.973,
+      "p99_ms": 26.775,
+      "max_ms": 36.474,
+      "mean_ms": 11.771,
+      "throughput_rps": 857.2
+    },
+    {
+      "variant": "full",
+      "concurrency": 50,
+      "requests": 3000,
+      "errors": 0,
+      "p50_ms": 72.898,
+      "p90_ms": 105.778,
+      "p99_ms": 165.182,
+      "max_ms": 188.714,
+      "mean_ms": 77.428,
+      "throughput_rps": 648.4
+    }
+  ]
+}

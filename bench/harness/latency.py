@@ -239,6 +239,7 @@ def environment() -> dict[str, Any]:
         "cores": os.cpu_count(),
         "memory_gb": round(memory / 2**30, 1),
         "os": platform.platform(),
+        "load_average_1m": round(os.getloadavg()[0], 2) if hasattr(os, "getloadavg") else None,
         "python": platform.python_version(),
         "versions": {
             pkg: version(pkg) for pkg in ("mcp-customs", "mcp", "uvicorn", "httpx2", "fastapi", "psycopg")
@@ -252,7 +253,8 @@ def markdown(env: dict[str, Any], results: list[Stats], requests: int) -> str:
         "# Latency overhead",
         "",
         f"Measured {env['date']} at commit `{env['commit']}` on {env['cpu']} ({env['cores']} cores, "
-        f"{env['memory_gb']} GB), {env['os']}, Python {env['python']}. "
+        f"{env['memory_gb']} GB, 1-minute load {env['load_average_1m']} at the start), {env['os']}, "
+        f"Python {env['python']}. "
         f"{requests} measured calls per cell after warm-up; `tools/call get_balance`, protocol {PROTOCOL}.",
         "",
         "Overhead is the gateway variant's percentile minus the direct percentile at the same concurrency.",

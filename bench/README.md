@@ -41,8 +41,11 @@ GIL. The gateway is one uvicorn process with uvloop and httptools, as
 - On macOS, Docker runs in a VM, so in `full` every audit commit crosses the
   VM boundary. Expect Linux with a local Postgres to do better.
 - With 3,000 samples, p99 rests on 30 values. Single-client p99 especially
-  moves with background noise; one negative p99 overhead in the first run
-  is that noise, not the gateway speeding anything up.
+  moves with background noise: a negative single-client p99 overhead is the
+  direct baseline catching a slow moment, not the gateway speeding anything
+  up.
+- The machine is not idle: the result header records the 1-minute load
+  average at the start of the run.
 - The CI smoke run uses shared runners. Its threshold catches gross
   regressions only; published numbers come from full runs on stated hardware.
 
