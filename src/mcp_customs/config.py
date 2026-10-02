@@ -4,16 +4,30 @@ String values may reference environment variables as ``${NAME}`` or
 ``${NAME:-default}``, so secrets such as upstream tokens stay out of the file.
 Expansion runs on parsed values, never on raw YAML text, so an environment
 variable cannot inject YAML structure.
+
+Relative file paths (policy files, public keys) resolve against the directory
+of the configuration file, not the working directory.
 """
 
 import os
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated, Any, Final
+from typing import Annotated, Any, Final, Literal, Self
 
 import yaml
-from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    AfterValidator,
+    AnyHttpUrl,
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from mcp_customs.proxy.headers import HOP_BY_HOP
 
@@ -27,6 +41,14 @@ class ConfigError(ValueError):
 
 class _Model(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+def _resolve_path(value: Path, info: ValidationInfo) -> Path:
+    base = (info.context or {}).get("base_dir")
+    return value if value.is_absolute() or base is None else Path(base) / value
+
+
+type ConfigPath = Annotated[Path, AfterValidator(_resolve_path)]
 
 
 class UpstreamConfig(_Model):
@@ -69,10 +91,82 @@ class SecurityConfig(_Model):
     (DNS-rebinding protection); requests without an ``Origin``, as sent by non-browser agents, pass."""
 
 
+_HMAC_ALGORITHMS: Final = frozenset({"HS256", "HS384", "HS512"})
+_ASYMMETRIC_ALGORITHMS: Final = frozenset(
+    {"RS256", "RS384", "RS512", "PS256", "PS384", "PS512", "ES256", "ES384", "ES512", "EdDSA"}
+)
+_MIN_HMAC_SECRET_BYTES: Final = 32
+
+
+class JwtConfig(_Model):
+    """How bearer tokens are verified. Exactly one key source must be set."""
+
+    audience: str = Field(min_length=1)
+    """Required: a token must be issued for the gateway, never passed through from elsewhere."""
+    issuer: str | None = None
+    algorithms: list[str] | None = None
+    """Defaults to HS256 for ``secret`` and RS256/ES256 for public keys."""
+
+    secret: SecretStr | None = None
+    """Shared HMAC secret, at least 32 bytes. For development and the demo."""
+    public_key_file: ConfigPath | None = None
+    """PEM public key of the token issuer."""
+    jwks_url: AnyHttpUrl | None = None
+    """The issuer's JSON Web Key Set, fetched and cached."""
+    jwks_cache_s: Annotated[float, Field(gt=0)] = 300.0
+
+    leeway_s: Annotated[float, Field(ge=0, le=300)] = 30.0
+    agent_claim: str = "sub"
+    roles_claim: str = "roles"
+    task_claim: str = "task"
+    scope_claim: str = "scope"
+
+    @model_validator(mode="after")
+    def _check_keys(self) -> Self:
+        sources = [self.secret, self.public_key_file, self.jwks_url]
+        if sum(source is not None for source in sources) != 1:
+            raise ValueError("set exactly one of secret, public_key_file or jwks_url")
+        allowed = _HMAC_ALGORITHMS if self.secret is not None else _ASYMMETRIC_ALGORITHMS
+        if bad := sorted(set(self.effective_algorithms) - allowed):
+            kind = "a shared secret" if self.secret is not None else "a public key"
+            raise ValueError(f"algorithm(s) {', '.join(bad)} cannot be used with {kind}")
+        if self.secret is not None and len(self.secret.get_secret_value().encode()) < _MIN_HMAC_SECRET_BYTES:
+            raise ValueError(f"secret must be at least {_MIN_HMAC_SECRET_BYTES} bytes")
+        return self
+
+    @property
+    def effective_algorithms(self) -> list[str]:
+        if self.algorithms:
+            return self.algorithms
+        return ["HS256"] if self.secret is not None else ["RS256", "ES256"]
+
+
+class AuthConfig(_Model):
+    jwt: JwtConfig
+    session_secret: SecretStr | None = None
+    """Key that binds handshake-era session ids to the agent that opened them. Set it when the
+    gateway runs as more than one replica or must keep sessions across restarts; otherwise a
+    random key is generated at start-up."""
+    resource_metadata_url: AnyHttpUrl | None = None
+    """Advertised in ``WWW-Authenticate`` so OAuth-capable clients can find the authorization server."""
+
+
+class PolicyStageConfig(_Model):
+    type: Literal["policy"]
+    file: ConfigPath
+
+
+type StageConfig = PolicyStageConfig
+
+
 class GatewayConfig(_Model):
     server: ServerConfig = ServerConfig()
     limits: LimitsConfig = LimitsConfig()
     security: SecurityConfig = SecurityConfig()
+    auth: AuthConfig | None = None
+    """Without it every caller is anonymous; with it every MCP request needs a valid bearer token."""
+    stages: list[StageConfig] = Field(default_factory=list)
+    """Pipeline stages, run in this order on every message."""
     upstreams: dict[Annotated[str, Field(pattern=UPSTREAM_NAME_PATTERN)], UpstreamConfig] = Field(
         min_length=1
     )
@@ -100,9 +194,11 @@ def expand_env(value: Any, environ: Mapping[str, str] | None = None) -> Any:
     return value
 
 
-def parse_config(data: Any, environ: Mapping[str, str] | None = None) -> GatewayConfig:
+def parse_config(
+    data: Any, environ: Mapping[str, str] | None = None, *, base_dir: Path | None = None
+) -> GatewayConfig:
     try:
-        return GatewayConfig.model_validate(expand_env(data, environ))
+        return GatewayConfig.model_validate(expand_env(data, environ), context={"base_dir": base_dir})
     except ValidationError as exc:
         raise ConfigError(str(exc)) from exc
 
@@ -116,4 +212,4 @@ def load_config(path: Path, environ: Mapping[str, str] | None = None) -> Gateway
         raise ConfigError(f"{path} is not valid YAML: {exc}") from exc
     if not isinstance(data, dict):
         raise ConfigError(f"{path} must contain a mapping at the top level")
-    return parse_config(data, environ)
+    return parse_config(data, environ, base_dir=path.parent)

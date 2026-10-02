@@ -1,0 +1,64 @@
+# An accounts-payable agent: it reads documents and balances, emails only
+# internal addresses, and pays known vendors from the operating account up to
+# the single-approver limit. Larger payments are denied here; once approvals
+# land they will wait for a human instead.
+#
+# Nothing is allowed unless a rule says so, and a deny rule beats any allow.
+version: 1
+description: Accounts-payable agent for the demo workspace and finance servers.
+
+rules:
+  - id: ap-read-documents
+    effect: allow
+    agents: [ap-agent]
+    upstreams: [workspace]
+    tools: [search_docs, read_doc]
+    resources: ["workspace://documents"]
+    prompts: [summarise_document]
+
+  - id: ap-internal-email
+    description: Email stays inside the company, and carries nothing but a subject and a body.
+    effect: allow
+    agents: [ap-agent]
+    upstreams: [workspace]
+    tools: [send_email]
+    arguments:
+      to: {matches: '[a-z0-9._%+-]+@acme\.example'}
+      subject: {max_length: 200}
+      body: {max_length: 5000}
+    additional_arguments: false
+
+  - id: ap-read-balances
+    effect: allow
+    agents: [ap-agent]
+    upstreams: [finance]
+    tools: [get_balance, list_transactions]
+    arguments:
+      limit: {min: 1, max: 50, optional: true}
+
+  - id: ap-pay-known-vendors
+    description: Single-approver payments to vendors on file, from the operating account.
+    effect: allow
+    agents: [ap-agent]
+    upstreams: [finance]
+    tools: [transfer_funds]
+    arguments:
+      from_account: {equals: ACC-OPERATING}
+      to_account: {in: [ACC-NORTHWIND]}
+      amount: {min: 0.01, max: 10000}
+      memo: {max_length: 140}
+    additional_arguments: false
+
+  - id: never-move-payroll
+    description: No agent moves money out of payroll, whatever else is allowed.
+    effect: deny
+    upstreams: [finance]
+    tools: [transfer_funds]
+    arguments:
+      from_account: {equals: ACC-PAYROLL}
+
+  - id: auditors-read-only
+    effect: allow
+    roles: [auditor]
+    upstreams: [workspace, finance]
+    tools: [search_docs, read_doc, get_balance, list_transactions]

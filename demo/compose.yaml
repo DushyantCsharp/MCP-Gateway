@@ -1,7 +1,10 @@
-# The demo stack: two sample MCP servers with the gateway in front.
+# The demo stack: two sample MCP servers, the gateway in front of them with
+# authentication and the example finance policy, and a stand-in identity
+# provider that mints the agents' tokens.
 #
 #   docker compose -f demo/compose.yaml up --build --wait
-#   docker compose -f demo/compose.yaml run --rm agent
+#   docker compose -f demo/compose.yaml run --rm agent                         # completes
+#   docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent   # blocked by policy
 #
 # The servers are also published on localhost:8001 and :8002, so the same
 # agent can be pointed at them directly to compare. If those ports are taken,
@@ -20,6 +23,11 @@ x-healthcheck: &healthcheck
   timeout: 3s
   retries: 10
   start_period: 3s
+
+x-token-secret: &token-secret
+  # Demo only. Anyone with this secret can mint tokens; a real deployment
+  # verifies tokens from its identity provider instead (auth.jwt.jwks_url).
+  CUSTOMS_JWT_SECRET: ${CUSTOMS_JWT_SECRET:-demo-only-secret-never-use-in-production}
 
 services:
   workspace:
@@ -43,12 +51,21 @@ services:
       context: ..
       dockerfile: Dockerfile
     image: mcp-customs:dev
+    environment: *token-secret
     volumes:
       - ./customs.yaml:/etc/customs/customs.yaml:ro
+      - ../policies/examples/finance-agent.yaml:/etc/customs/policy.yaml:ro
     ports: ["127.0.0.1:${CUSTOMS_PORT:-8000}:8000"]
     depends_on:
       workspace: {condition: service_healthy}
       finance: {condition: service_healthy}
+
+  issuer:
+    <<: *demo-image
+    profiles: ["agent"]  # runs once, before an agent; keeps `up --wait` about long-running services
+    command: ["customs-demo-issuer", "--out-dir", "/tokens"]
+    environment: *token-secret
+    volumes: ["tokens:/tokens"]
 
   agent:
     <<: *demo-image
@@ -57,5 +74,12 @@ services:
     environment:
       WORKSPACE_MCP_URL: http://gateway:8000/mcp/workspace
       FINANCE_MCP_URL: http://gateway:8000/mcp/finance
+      MCP_BEARER_TOKEN_FILE: /tokens/ap-agent.jwt
+      AGENT_TASK: ${AGENT_TASK:-summary}
+    volumes: ["tokens:/tokens:ro"]
     depends_on:
+      issuer: {condition: service_completed_successfully}
       gateway: {condition: service_healthy}
+
+volumes:
+  tokens:

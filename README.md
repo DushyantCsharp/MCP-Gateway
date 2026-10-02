@@ -4,11 +4,11 @@ A security and governance gateway for MCP. It sits between an agent and its
 MCP servers and inspects every message in both directions: what goes out,
 what comes back, and what should not cross at all.
 
-> **Status: v0.0.1, pass-through.** The proxy, its pipeline hooks, the demo
-> stack and the contract tests are in place. Policy, detection, approvals,
-> budgets and audit land over the coming milestones (see the
-> [roadmap](#roadmap)). Until then, nothing is blocked; do not deploy this as
-> a security control.
+> **Status: pre-release, identity and policy.** With authentication and a
+> policy configured, every request is authenticated and every tool call is
+> checked against the policy, in both MCP protocol eras. Injection detection, redaction, approvals, budgets and
+> audit land over the coming milestones (see the [roadmap](#roadmap)). Until
+> then the gateway does not inspect tool results for injected instructions.
 >
 > Benchmark results (detection rate, false-positive rate, latency overhead,
 > and attack success rate with the gateway off vs on) will lead this README
@@ -20,25 +20,36 @@ Requires Docker.
 
 ```bash
 docker compose -f demo/compose.yaml up --build --wait
-docker compose -f demo/compose.yaml run --rm agent
+docker compose -f demo/compose.yaml run --rm agent                            # TASK COMPLETE
+docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent  # TASK BLOCKED
 ```
 
 This starts two sample MCP servers (`workspace`: documents and email;
-`finance`: balances and transfers) with the gateway in front, then runs a
-scripted agent that completes an accounts-payable task through the gateway.
+`finance`: balances and transfers) with the gateway in front of them. The
+gateway requires tokens and enforces the
+[example finance policy](policies/examples/finance-agent.yaml). A stand-in
+identity provider mints the agent's token, and a scripted agent then
+summarises an invoice (allowed) and tries to pay it. The payment of 18,450 is
+over the policy's 10,000 single-approver limit, so the gateway blocks it and
+the agent reads why. To try other identities, add
+`-e MCP_BEARER_TOKEN_FILE=/tokens/auditor.jwt` (read-only) or
+`/tokens/intruder.jwt` (sees no tools at all).
+
 If ports 8000 to 8002 are taken, set `CUSTOMS_PORT`, `WORKSPACE_PORT` or
 `FINANCE_PORT`.
 
 ## Drop-in
 
-Point the client at the gateway instead of the server. Nothing else changes.
+Point the client at the gateway instead of the server, and give it a token.
+No agent code changes.
 
 ```diff
  {
    "mcpServers": {
      "workspace": {
 -      "url": "http://workspace.internal:8001/mcp"
-+      "url": "http://customs.internal:8000/mcp/workspace"
++      "url": "http://customs.internal:8000/mcp/workspace",
++      "headers": {"Authorization": "Bearer ${AGENT_TOKEN}"}
      }
    }
  }
@@ -49,26 +60,62 @@ Point the client at the gateway instead of the server. Nothing else changes.
 server:
   host: 0.0.0.0
   port: 8000
+auth:
+  jwt:
+    audience: mcp-customs
+    issuer: https://idp.example.com/
+    jwks_url: https://idp.example.com/.well-known/jwks.json
+stages:
+  - type: policy
+    file: policies/finance-agent.yaml
 upstreams:
   workspace:
     url: http://workspace.internal:8001/mcp
   finance:
     url: http://finance.internal:8002/mcp
     headers:
-      Authorization: Bearer ${FINANCE_MCP_TOKEN}  # the upstream's credential, injected by the gateway
+      Authorization: Bearer ${FINANCE_MCP_TOKEN}  # the upstream's own credential, injected by the gateway
 ```
 
 ```bash
-customs check-config -c customs.yaml
+customs check-config -c customs.yaml        # validates the config and every policy it loads
+customs check-policy policies/finance-agent.yaml --agent ap-agent --upstream finance \
+  --tool transfer_funds --arguments '{"from_account": "ACC-OPERATING", "to_account": "ACC-NORTHWIND", "amount": "18450.00", "memo": "INV-2026-091"}'
 customs run -c customs.yaml
+customs token issue --agent ap-agent        # HS256 development tokens from $CUSTOMS_JWT_SECRET
 ```
 
 Both MCP transport eras work through the same endpoint: the session-based
 revisions (2024-11-05 to 2025-11-25) and the stateless 2026-07-28 revision.
 
-## What the gateway already guarantees
+## Identity and policy
 
-Even with no stages configured:
+- **Every request is authenticated** once `auth` is configured: a JWT verified against a shared
+  secret, a public key or the issuer's JWKS, and issued for the gateway's
+  audience. Streams and session ends need one too.
+- **Sessions belong to their agent.** Session ids are HMAC-bound to the agent
+  that opened them; another agent's token cannot reuse one.
+- **Deny by default, deny beats allow.** Rules match agent, role, upstream,
+  tool and argument constraints. An argument the gateway cannot check (wrong
+  type, missing, too long) never satisfies an allow rule and always triggers a
+  deny rule.
+- **Task-scoped tokens.** `mcp:<upstream>:<tool>` scope entries narrow a
+  token to what one task needs. They can only narrow the policy, never widen it.
+- **Least visibility.** Tool, prompt and resource listings are filtered to
+  what the caller may use.
+- **Readable denials.** A blocked tool call returns a tool error the model
+  can read and recover from. The upstream never sees the call.
+
+The enforcement suite proves the last point at the upstream, not by
+trusting the gateway's own report. A recorder wrapped around each real server
+checks a 40-case decision table in both protocol eras (29 of 29 disallowed
+calls blocked, 11 of 11 allowed calls delivered), plus 300 fuzzed transfers per
+run, against an independent restatement of the policy. See the
+[policy reference](docs/policy-reference.md).
+
+## What the gateway guarantees on the wire
+
+With or without stages configured:
 
 - **One strict JSON-RPC message per request.** Batches, duplicate keys and
   `NaN` are refused, so the gateway and the server cannot read the same body
@@ -105,16 +152,19 @@ response framing.
 | Path | What is there |
 | --- | --- |
 | `src/mcp_customs/proxy/` | Streamable HTTP reverse proxy, SSE relay, header and routing rules |
-| `src/mcp_customs/pipeline/` | stage interface, pipeline, version-aware gateway replies |
+| `src/mcp_customs/auth/` | JWT verification, identities and scope grants, session binding |
+| `src/mcp_customs/policy/` | policy file model, rules engine, request targets |
+| `src/mcp_customs/pipeline/` | stage interface, pipeline, policy stage, version-aware replies |
 | `src/mcp_customs/jsonrpc.py` | strict JSON-RPC parsing |
-| `demo/` | sample MCP servers, scripted agent, Compose stack |
-| `tests/contract/` | real-client tests through a running gateway |
-| `docs/` | architecture |
+| `policies/examples/` | finance, read-only and coding agent policies |
+| `demo/` | sample MCP servers, scripted agent, stand-in identity provider, Compose stack |
+| `tests/contract/` | real-client tests through a running gateway, including policy enforcement |
+| `docs/` | architecture, policy reference, build notes (what we found, milestone by milestone) |
 
 ## Roadmap
 
 - [x] **Pass-through proxy:** both transport eras, contract tests, CI, Compose demo
-- [ ] **Identity and policy:** agent identity from a token, YAML allow/deny by agent, tool and arguments
+- [x] **Identity and policy:** JWT identity and task scopes, bound sessions, YAML policy with argument constraints
 - [ ] **Audit and telemetry:** hash-chained audit log with `verify-audit`, OpenTelemetry spans, first latency numbers
 - [ ] **Injection detection, layer one:** rules on tool output, attack and benign datasets, per-category results
 - [ ] **Classifier and data protection:** open-source classifier layer, PII and secret redaction

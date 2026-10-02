@@ -1,7 +1,7 @@
 """Real servers on real sockets: two sample MCP servers, a rogue upstream and gateways in front."""
 
 import socket
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -60,14 +60,16 @@ def direct_urls(workspace_url: str, finance_url: str) -> dict[str, str]:
     return {"workspace": workspace_url, "finance": finance_url}
 
 
-def make_config(upstreams: dict[str, str | dict[str, Any]], **sections: Any) -> GatewayConfig:
+def make_config(upstreams: Mapping[str, str | dict[str, Any]], **sections: Any) -> GatewayConfig:
     entries = {name: spec if isinstance(spec, dict) else {"url": spec} for name, spec in upstreams.items()}
     return parse_config({"upstreams": entries, **sections})
 
 
 @contextmanager
 def running_gateway(config: GatewayConfig, stages: list[Stage] | None = None) -> Iterator[Gateway]:
-    with serve_in_thread(create_app(config, pipeline=Pipeline(stages or []))) as base:
+    """Serve a gateway. ``stages`` replaces the pipeline; without it, ``config.stages`` builds one."""
+    pipeline = Pipeline(stages) if stages is not None else None
+    with serve_in_thread(create_app(config, pipeline=pipeline)) as base:
         yield Gateway(base)
 
 

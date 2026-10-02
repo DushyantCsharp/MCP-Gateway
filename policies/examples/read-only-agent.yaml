@@ -1,0 +1,21 @@
+# A research agent that may look but never touch: no email, no transfers,
+# nothing that writes. It matches tools by name prefix, which is convenient but
+# only as safe as the servers' naming; listing tools by exact name is stricter.
+version: 1
+description: Read-only research agent.
+
+rules:
+  - id: research-reads
+    effect: allow
+    agents: [research-agent]
+    tools: ["search_*", "read_*", "get_*", "list_*"]
+    resources: ["*"]
+    prompts: ["*"]
+
+  - id: no-bulk-reads
+    description: Cap page sizes so one call cannot dump a whole ledger.
+    effect: deny
+    agents: [research-agent]
+    tools: ["list_*", "search_*"]
+    arguments:
+      limit: {min: 51, optional: true}

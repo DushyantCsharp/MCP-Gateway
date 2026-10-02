@@ -2,12 +2,15 @@
 
 The gateway makes decisions on what it parses and forwards what the upstream
 parses, so the two must agree. Lenient parsers disagree on duplicate keys
-(first wins vs last wins) and on non-standard constants such as ``NaN``; a
-message that relies on either could pass a policy check as one tool call and
-run upstream as another. Both are rejected here rather than normalised.
+(first wins vs last wins), on non-standard constants such as ``NaN``, and on
+numbers too large for a double (``1e400`` is infinity to Python, an exact
+decimal to others). A message that relies on any of these could pass a policy
+check as one call and run upstream as another, so all are rejected here
+rather than normalised.
 """
 
 import json
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Final
@@ -28,6 +31,9 @@ HEADER_MISMATCH: Final = -32020
 UPSTREAM_UNAVAILABLE: Final = -32080
 UPSTREAM_TIMEOUT: Final = -32081
 UPSTREAM_BAD_RESPONSE: Final = -32082
+UNAUTHENTICATED: Final = -32083
+SESSION_NOT_FOUND: Final = -32084
+POLICY_DENIED: Final = -32090
 
 
 class MessageKind(StrEnum):
@@ -87,11 +93,23 @@ def _reject_constant(name: str) -> Any:
     raise JsonRpcError(PARSE_ERROR, f"Non-standard JSON constant {name}")
 
 
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise JsonRpcError(PARSE_ERROR, "Number out of range")
+    return value
+
+
 def loads_strict(data: bytes | str) -> Any:
-    """Decode RFC 8259 JSON from UTF-8, rejecting duplicate keys and NaN/Infinity."""
+    """Decode RFC 8259 JSON from UTF-8, rejecting duplicate keys and non-finite numbers."""
     try:
         text = data.decode("utf-8") if isinstance(data, bytes) else data
-        return json.loads(text, object_pairs_hook=_reject_duplicate_keys, parse_constant=_reject_constant)
+        return json.loads(
+            text,
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_constant,
+            parse_float=_finite_float,
+        )
     except JsonRpcError:
         raise
     except (UnicodeDecodeError, ValueError, RecursionError) as exc:

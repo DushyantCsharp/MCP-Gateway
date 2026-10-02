@@ -63,3 +63,34 @@ def test_unreadable_files_are_reported(tmp_path: Path, content: str, message: st
 def test_missing_files_are_reported(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="cannot read"):
         load_config(tmp_path / "absent.yaml")
+
+
+def test_relative_paths_resolve_against_the_config_file(tmp_path: Path) -> None:
+    path = tmp_path / "conf" / "customs.yaml"
+    path.parent.mkdir()
+    path.write_text(
+        "auth:\n  jwt:\n    audience: a\n    public_key_file: keys/issuer.pub\n"
+        "stages:\n  - type: policy\n    file: ../policies/p.yaml\n"
+        "upstreams:\n  w:\n    url: http://w/mcp\n"
+    )
+    config = load_config(path)
+    assert config.auth is not None
+    assert config.auth.jwt.public_key_file == tmp_path / "conf" / "keys" / "issuer.pub"
+    assert config.stages[0].file == tmp_path / "conf" / "../policies/p.yaml"
+
+
+def test_jwt_algorithms_default_by_key_source() -> None:
+    upstreams = {"w": {"url": "http://w/mcp"}}
+    secret = parse_config({"auth": {"jwt": {"audience": "a", "secret": "s" * 32}}, "upstreams": upstreams})
+    jwks = parse_config(
+        {"auth": {"jwt": {"audience": "a", "jwks_url": "https://idp/jwks"}}, "upstreams": upstreams}
+    )
+    assert secret.auth is not None
+    assert jwks.auth is not None
+    assert secret.auth.jwt.effective_algorithms == ["HS256"]
+    assert jwks.auth.jwt.effective_algorithms == ["RS256", "ES256"]
+
+
+def test_unknown_stage_types_are_rejected() -> None:
+    with pytest.raises(ConfigError):
+        parse_config({"stages": [{"type": "magic"}], "upstreams": {"w": {"url": "http://w/mcp"}}})

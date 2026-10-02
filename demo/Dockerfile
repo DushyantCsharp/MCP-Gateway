@@ -15,7 +15,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --locked --no-dev --no-editable --package customs-demo
 
 FROM python:3.12-slim-trixie
-RUN groupadd --system demo && useradd --system --gid demo --no-create-home demo
+RUN groupadd --system demo && useradd --system --gid demo --no-create-home demo \
+    && mkdir /tokens && chown demo:demo /tokens
 COPY --from=build --chown=demo:demo /app/.venv /app/.venv
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 HOST=0.0.0.0
 USER demo

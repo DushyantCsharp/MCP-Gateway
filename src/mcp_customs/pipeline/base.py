@@ -18,6 +18,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import ClassVar
 
+from mcp_customs.auth.identity import Identity
 from mcp_customs.jsonrpc import JSONObject, Message, MessageKind, classify
 from mcp_customs.proxy.routing import name_param
 
@@ -32,6 +33,9 @@ class Exchange:
     """The client's request headers, case-insensitive."""
     protocol_version: str | None
     session_id: str | None
+    """The upstream's session id (handshake era), as the upstream issued it."""
+    identity: Identity | None = None
+    """The authenticated caller; ``None`` when the gateway runs without authentication."""
 
 
 @dataclass(frozen=True, slots=True)
