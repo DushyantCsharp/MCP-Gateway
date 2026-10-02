@@ -3,6 +3,8 @@
 from collections.abc import Sequence
 
 from mcp_customs.config import InjectionStageConfig, PolicyStageConfig, RedactionStageConfig, StageConfig
+from mcp_customs.detectors import Detector
+from mcp_customs.detectors.hidden import HiddenTextDetector, LayeredDetector
 from mcp_customs.detectors.sensitive import SensitiveScanner
 from mcp_customs.pipeline.base import Pipeline, Stage
 from mcp_customs.pipeline.injection import InjectionStage
@@ -16,10 +18,15 @@ def build_stage(config: StageConfig) -> Stage:
         case PolicyStageConfig():
             return PolicyStage(RulePolicy.load(config.file))
         case InjectionStageConfig():
-            from mcp_customs.detectors.classifier import OnnxClassifier
+            detector: Detector = HiddenTextDetector()
+            if config.detector != "hidden":
+                from mcp_customs.detectors.classifier import OnnxClassifier
 
-            detector = OnnxClassifier(threads=1)
-            detector.load()  # downloads the model on first start, and fails fast if it cannot
+                classifier = OnnxClassifier(threads=1, max_chars=config.max_chars)
+                classifier.load()  # downloads the model on first start, and fails fast if it cannot
+                detector = (
+                    classifier if config.detector == "classifier" else LayeredDetector([detector, classifier])
+                )
             return InjectionStage(
                 detector, mode=config.mode, threshold=config.threshold, threads=config.threads
             )

@@ -160,12 +160,16 @@ class InjectionStageConfig(_Model):
     """Inspect tool results for prompt injection before the agent reads them."""
 
     type: Literal["injection"]
-    detector: Literal["classifier"] = "classifier"
-    """``classifier``: ProtectAI's DeBERTa prompt-injection model on ONNX Runtime (``[classifier]`` extra)."""
+    detector: Literal["classifier", "hidden", "layered"] = "layered"
+    """``hidden``: the cheap checks for text a reader cannot see; ``classifier``: ProtectAI's DeBERTa
+    prompt-injection model on ONNX Runtime (``[classifier]`` extra); ``layered``: both, cheap first."""
     mode: Literal["block", "flag", "strip"] = "block"
     threshold: Annotated[float, Field(ge=0, le=1)] = 0.5
     threads: Annotated[int, Field(ge=1, le=64)] = 2
     """Detector threads; scoring is CPU-bound and runs off the event loop."""
+    max_chars: Annotated[int, Field(ge=1000)] | None = 16_000
+    """The classifier reads at most this many characters of one text (the first and last halves); the
+    cheap checks always read all of it. Bounds the cost of very long results. ``null`` reads everything."""
 
 
 class RedactionStageConfig(_Model):
