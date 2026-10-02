@@ -215,12 +215,137 @@ real upstream. Each run also fuzzes 300 transfers through the gateway and
     mounted over, so the demo image creates `/tokens` owned by its non-root
     user.
 
+## Weekend 3: audit, telemetry, first benchmark (2026-10-02)
+
+**Result:** every call has a trace and a verifiable audit row, checked in
+both protocol eras by `tests/contract/test_observability.py`, and in CI
+against the deployed demo stack (`verify-audit` plus a query to Jaeger).
+First latency numbers are in `bench/results/`; see *Performance* below.
+
+### Tracing
+
+1. **MCP carries trace context in the body**, `params._meta.traceparent`
+   (SEP-414), not in HTTP headers. The SDK client injects it and the SDK
+   server reads it. The gateway reads it too, so its spans join the agent's
+   trace.
+   *Decision:* do not rewrite `_meta` to make the upstream span a child of
+   the gateway's, since that would break byte-identical relaying. The
+   upstream span is a sibling under the agent's span, and a `traceparent`
+   HTTP header carries the gateway's span for HTTP-level tooling
+   (`test_the_gateway_joins_the_callers_trace`).
+
+2. **The MCP semantic conventions exist** in OpenTelemetry's incubating set
+   (`mcp.method.name`, `mcp.protocol.version`, `mcp.session.id`,
+   `jsonrpc.request.id`, alongside GenAI's `gen_ai.tool.name`), and the MCP
+   SDK already uses them. The gateway uses the same names, pinned to schema
+   1.44.0.
+
+3. **Each gateway app owns its tracer provider** rather than installing a
+   global one. The tests run several gateways in one process, and a global
+   provider would mix their spans.
+
+4. **Answers get stage spans; the notifications before them do not.** A
+   progress-heavy stream would otherwise bury the trace in spans for every
+   progress event.
+
+### Audit
+
+5. **Write before forwarding, and refuse if the write fails.** In durable
+   mode a call's `request` row must commit before the call is forwarded, so
+   an outage refuses calls (503) rather than running them unaudited.
+   Group commit keeps the cost to about one transaction per batch. The
+   outcome (`result`) is written after the response and is not durable: a
+   crash between the two loses the outcome, not the fact of the call.
+
+6. **Hash the text, query the JSON.** Postgres `jsonb` normalises key order
+   and number formatting, so hashing what `jsonb` gives back would not
+   reproduce what was hashed. Each row stores the canonical JSON text that
+   was hashed, plus a generated `jsonb` column for queries.
+
+7. **The algorithm is stored per row, and verification enforces it.**
+   Otherwise someone could replace keyed HMAC rows with plain SHA-256 rows
+   they can compute themselves. Verifying with a key rejects any unkeyed row
+   as a possible downgrade (`test_downgrading_a_keyed_chain_is_detected`).
+
+8. **One writer per chain.** A session advisory lock makes a second gateway
+   on the same chain fail at start-up, and the `(chain, seq)` primary key
+   makes a fork unwritable even without the lock. A container's host name
+   changes when it is recreated, so the demo names its chain explicitly.
+
+### Bugs the tests caught
+
+9. **Postgres tests skipped silently.** testcontainers 4.15 deprecated its
+   `testcontainers.postgres` import path. The test configuration turns
+   warnings into errors, and a broad `except` around container start-up
+   turned that error into "Docker unavailable, skip". All eight audit tests
+   "passed" by skipping. Now only real Docker errors skip, and CI sets
+   `CUSTOMS_REQUIRE_POSTGRES` so a skip there is a failure. Lesson: a skip
+   is a silent pass, so make it fail where it matters.
+
+10. **Shutdown hung while the audit store was down.** The writer retried
+    forever, and the app's lifespan waited for it. The test's thread-join
+    timeout hid it: the only symptom was a 15-second test. `close()` now
+    gives the store `commit_timeout_s` to come back, then stops the writer
+    and logs how many events were not written
+    (`test_shutdown_does_not_hang_on_a_dead_store`).
+
+11. **A stream closed by the client never ended its spans.** A client that
+    disconnects mid-stream closes the relay's generator (`GeneratorExit`),
+    not cancels it, so the cancellation handler never ran. The relay now
+    tracks whether it reached the end.
+
+12. **A false positive in mypy.** OpenTelemetry's recursive `AnyValue` type
+    alias makes `attributes.get(key) == "x"` look impossible to strict
+    equality checking, so mypy flagged code that does run as unreachable.
+
+### Tooling
+
+13. **Jaeger 2.21 dropped the old query API.** `/api/traces` returns 404;
+    traces are at `/api/v3/traces`, as OTLP JSON
+    (`demo/scripts/check_traces.py`).
+14. **The Weekend 2 follow-up is done:** the gateway logs what it enforces at
+    start-up, and warns when authentication, stages or audit are off
+    (`tests/unit/test_app_describe.py`).
+
+### Performance
+
+15. **Per-call cost is small; throughput is the limit.** Measured on an Apple
+    M4 (`bench/results/latency-2026-10-02.md`, commit `0a7f95f`), with one
+    client the gateway adds 0.40 ms p50 as a pass-through, 0.47 ms with
+    authentication and policy, and 1.57 ms with durable audit and tracing as
+    well. Most of the last is the audit commit, which on macOS crosses
+    Docker's VM.
+    At 10 and 50 clients the gateway becomes the bottleneck: one process
+    peaks at roughly 1,000 to 1,500 calls a second, against about 3,500 for
+    the MCP server behind it, and queueing dominates (+33.6 ms p50 for the
+    pass-through at 50 clients).
+
+16. **The profile points at the HTTP client, not the gateway's logic.**
+    Under load, the largest single cost is `httpcore2`'s connection pool,
+    which checks every idle socket for readability (a `poll` call) on each
+    request. Next come `h11` header handling and `anyio` socket bookkeeping.
+    Parsing, routing checks and policy hardly register. The plan's stack
+    table predicted "slower than Go; fine at this scale, and the benchmark
+    will show it", and it does. Options, cheapest first: several workers,
+    each with its own audit chain; a C-accelerated upstream client; a
+    compiled hot path.
+
+17. **Measure what you publish against a clean commit.** The first run
+    recorded the last commit while the code under test was uncommitted. The
+    harness now appends `+dirty` when `src/` or `demo/` has uncommitted
+    changes, and records the machine's load average (3.3 here, from
+    unrelated containers that were left running).
+
 ## Follow-ups
 
 | Item | Why | When |
 | --- | --- | --- |
-| Log the active auth mode and pipeline stages at start-up | A gateway silently running without its policy is the worst failure (W2 finding 4) | Weekend 3 |
-| Audit every decision, with the deciding rule | Denials are only logged today | Weekend 3 |
+| ~~Log the active auth mode and pipeline stages at start-up~~ | Done in Weekend 3 | |
+| ~~Audit every decision, with the deciding rule~~ | Done in Weekend 3 | |
+| Raise per-process throughput, or document scaling out | One process tops out at about 1,000 to 1,500 calls a second, set by the pure-Python HTTP client | Before v0.1 |
+| Anchor audit chain heads outside the database | Without that, cutting off the newest rows cannot be detected | Before v0.1 |
+| Least-privilege audit role (INSERT and SELECT only) and retention or partitioning | The demo connects as the table owner, which can drop the triggers | Before v0.1 |
+| OpenTelemetry metrics (decisions, latency histograms) | Traces exist; dashboards need metrics | After v0.1 |
 | Recompute `Mcp-Param-*` headers when a stage rewrites arguments | Redaction will change header-mirrored values; today the upstream rejects the mismatch, which fails closed | Weekend 5 |
 | Treat results on resumed GET streams conservatively | They arrive without the request they answer | Weekend 4 |
 | Cancel the upstream call when the client disconnects before response headers | Wasted upstream work, and a modern-era cancellation not honoured | Before v0.1 |

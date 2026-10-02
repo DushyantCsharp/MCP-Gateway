@@ -40,6 +40,7 @@ class PolicyStage(Stage):
         try:
             target = target_of(message)
         except MalformedTargetError as exc:
+            ctx.annotations[self.name] = {"decision": "deny", "reason": str(exc)}
             return error_reply(ctx, INVALID_PARAMS, str(exc))
         if target is None:
             return CONTINUE
@@ -48,6 +49,11 @@ class PolicyStage(Stage):
         decision = self.engine.decide(
             PolicyRequest(identity, ctx.exchange.upstream, target.kind, target.name, target.arguments)
         )
+        ctx.annotations[self.name] = {
+            "decision": "allow" if decision.allowed else "deny",
+            "rule": decision.rule,
+            "reason": decision.reason,
+        }
         if decision.allowed:
             return CONTINUE
         logger.info(
@@ -81,6 +87,7 @@ class PolicyStage(Stage):
             return isinstance(name, str) and self.engine.visible(identity, upstream, kind, name)
 
         kept = [item for item in items if shown(item)]
+        ctx.annotations[self.name] = {"listed": len(kept), "hidden": len(items) - len(kept)}
         shared = result.get("cacheScope", "private") != "private"
         if len(kept) == len(items) and not shared:
             return CONTINUE

@@ -159,6 +159,40 @@ class PolicyStageConfig(_Model):
 type StageConfig = PolicyStageConfig
 
 
+class AuditConfig(_Model):
+    """The hash-chained audit log in Postgres."""
+
+    dsn: SecretStr
+    """Postgres connection string, e.g. ``postgresql://customs:...@postgres:5432/customs``."""
+    chain: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")] | None = None
+    """This gateway's chain. Each running gateway needs its own; defaults to the host name."""
+    key: SecretStr | None = None
+    """HMAC key for the chain. Without it the chain uses plain SHA-256, which detects edits by anyone
+    who does not recompute every later hash; with it, rewriting history also needs the key."""
+    durable: bool = True
+    """Wait for a call's audit row to commit before forwarding the call. If the log cannot be written,
+    calls are refused rather than run unaudited. ``False`` trades that guarantee for latency."""
+    record_arguments: bool = False
+    """Store call arguments in the log. Off by default: they may hold personal data or secrets, and
+    a SHA-256 digest of them is always recorded."""
+    queue_size: Annotated[int, Field(gt=0)] = 10_000
+    batch_size: Annotated[int, Field(gt=0, le=10_000)] = 500
+    commit_timeout_s: Annotated[float, Field(gt=0)] = 5.0
+    """How long a durable call waits for its row before the gateway refuses it."""
+    create_schema: bool = True
+    """Create the table, index and append-only triggers at start-up if they are missing."""
+
+
+class TelemetryConfig(_Model):
+    """OpenTelemetry tracing, exported over OTLP/HTTP (Jaeger, Tempo, an OTel Collector...)."""
+
+    otlp_endpoint: AnyHttpUrl | None = None
+    """Base URL such as ``http://jaeger:4318``; omitted, the standard ``OTEL_EXPORTER_OTLP_*``
+    environment variables apply."""
+    service_name: str = "mcp-customs"
+    sample_ratio: Annotated[float, Field(ge=0, le=1)] = 1.0
+
+
 class GatewayConfig(_Model):
     server: ServerConfig = ServerConfig()
     limits: LimitsConfig = LimitsConfig()
@@ -167,6 +201,8 @@ class GatewayConfig(_Model):
     """Without it every caller is anonymous; with it every MCP request needs a valid bearer token."""
     stages: list[StageConfig] = Field(default_factory=list)
     """Pipeline stages, run in this order on every message."""
+    audit: AuditConfig | None = None
+    telemetry: TelemetryConfig | None = None
     upstreams: dict[Annotated[str, Field(pattern=UPSTREAM_NAME_PATTERN)], UpstreamConfig] = Field(
         min_length=1
     )
