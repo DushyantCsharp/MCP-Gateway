@@ -159,7 +159,7 @@ response framing.
 | `policies/examples/` | finance, read-only and coding agent policies |
 | `demo/` | sample MCP servers, scripted agent, stand-in identity provider, Compose stack |
 | `tests/contract/` | real-client tests through a running gateway, including policy enforcement |
-| `docs/` | architecture, policy reference |
+| `docs/` | architecture, policy reference, build notes (what we found, milestone by milestone) |
 
 ## Roadmap
 
