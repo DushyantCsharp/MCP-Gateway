@@ -50,6 +50,7 @@ bench = [
 ]
 dev = [
     "customs-demo",
+    "mcp-customs[classifier]",  # type-check and unit-test the classifier code (the model itself is not fetched)
     "hypothesis>=6",
     "mypy>=2.4",
     "pre-commit>=4.6",
