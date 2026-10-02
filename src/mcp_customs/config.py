@@ -163,8 +163,14 @@ class InjectionStageConfig(_Model):
     detector: Literal["classifier", "hidden", "layered"] = "layered"
     """``hidden``: the cheap checks for text a reader cannot see; ``classifier``: ProtectAI's DeBERTa
     prompt-injection model on ONNX Runtime (``[classifier]`` extra); ``layered``: both, cheap first."""
-    mode: Literal["block", "flag", "strip"] = "block"
+    mode: Literal["block", "flag", "strip"] = "flag"
+    """``flag`` by default: the classifier's measured false-positive rate makes ``block`` unsafe unless
+    ``classifier_threshold`` is raised (see ``bench/results``)."""
     threshold: Annotated[float, Field(ge=0, le=1)] = 0.5
+    """On calibrated scores: 0.5 means a detector is at its own decision point."""
+    classifier_threshold: Annotated[float, Field(gt=0, le=1)] = 0.5
+    """The classifier's own decision point. 0.5 is the model's; about 0.997 gave 4% false positives on
+    the benchmark's test split, at about half the detection rate."""
     threads: Annotated[int, Field(ge=1, le=64)] = 2
     """Detector threads; scoring is CPU-bound and runs off the event loop."""
     max_chars: Annotated[int, Field(ge=1000)] | None = 16_000

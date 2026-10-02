@@ -4,7 +4,7 @@ import base64
 
 import pytest
 
-from mcp_customs.detectors import Detection
+from mcp_customs.detectors import Calibrated, Detection
 from mcp_customs.detectors.hidden import HiddenTextDetector, LayeredDetector
 
 DETECTOR = HiddenTextDetector()
@@ -99,3 +99,29 @@ def test_layers_keep_the_strongest_and_skip_work_once_certain() -> None:
     assert (certain.score, Expensive.calls) == (1.0, 0)
     combined = layered.detect("plain text")
     assert (combined.score, combined.rules, Expensive.calls) == (0.7, ("expensive:model",), 1)
+
+
+class Fixed:
+    name = "fixed"
+
+    def __init__(self, score: float) -> None:
+        self.score = score
+
+    def detect(self, text: str) -> Detection:
+        return Detection(self.score, self.name)
+
+
+@pytest.mark.parametrize(
+    ("raw", "cut", "scaled"),
+    [(0.0, 0.997, 0.0), (0.997, 0.997, 0.5), (1.0, 0.997, 1.0), (0.4985, 0.997, 0.25), (0.75, 0.5, 0.75)],
+)
+def test_calibration_puts_each_detectors_decision_point_at_one_half(
+    raw: float, cut: float, scaled: float
+) -> None:
+    assert Calibrated(Fixed(raw), cut).detect("x").score == pytest.approx(scaled)
+
+
+def test_a_high_classifier_cut_does_not_silence_the_cheap_checks() -> None:
+    layered = LayeredDetector([HiddenTextDetector(), Calibrated(Fixed(0.99), 0.997)])
+    assert layered.detect("plain").score < 0.5  # the classifier is below its own cut
+    assert layered.detect("log in at p\u0430ypal").score >= 0.5  # a cheap check still counts

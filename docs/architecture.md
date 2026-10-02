@@ -77,6 +77,45 @@ rules and their semantics are in the [policy reference](policy-reference.md).
 The engine sits behind a small interface (`PolicyEngine`), so an OPA or Cedar
 adapter could replace it.
 
+## Redaction
+
+The redaction stage keeps secrets and personal data from crossing the
+gateway. On the way out it scans the string arguments of `tools/call` and
+`prompts/get`, by default for secrets only, so a model cannot paste a
+credential into a tool. (A recipient's email address is personal data, but
+sending email needs it.) On the way back it scans every string a model would
+read, by default for secrets and personal data.
+
+| Kind | Examples | Checked by |
+| --- | --- | --- |
+| secrets | private keys, AWS, GitHub, Slack, Stripe, Google and AI API keys, JWTs, bearer tokens, `user:password@` in URLs, `password=` / `api_key:` values | pattern; only the value after a label |
+| pii | emails, phone numbers, payment cards, IBANs, South African ID numbers, US SSNs | pattern plus Luhn, mod 97, date and issuance checks |
+
+`redact` replaces each value with `[REDACTED:<kind>]` and notes it under
+`_meta["io.github.mcp-customs/redaction"]`. `flag` only records it, in
+`_meta`, the audit row and the span. `block` refuses the call (`-32092` for
+prompts) or withholds the result, naming the kinds and fields, never the
+values. `allow` lists patterns for values that must pass, such as internal
+addresses.
+
+```yaml
+stages:
+  - type: policy          # first: decide on the real values
+    file: policies/finance-agent.yaml
+  - type: redaction       # then scrub them
+    mode: redact
+    requests: [secrets]
+    responses: [secrets, pii]
+    allow: ['.*@acme\.example']
+```
+
+**Rewritten arguments and `Mcp-Param-*` headers.** At 2026-07-28 a client
+copies some arguments into headers, and the server refuses a call whose
+headers and body disagree. The gateway learns which arguments each tool
+mirrors from the `tools/list` answers it relays. When a stage rewrites
+arguments, it recomputes those headers to match. If it has never seen the
+tool's schema, it refuses the call rather than send stale headers.
+
 ## Injection detection
 
 The injection stage scores every string a model would read in the answers
@@ -95,13 +134,23 @@ stages:
   - type: policy
     file: policies/finance-agent.yaml
   - type: injection
+    detector: layered   # hidden | classifier | layered
     mode: flag          # block | flag | strip
     threshold: 0.997    # chosen on the benchmark's dev split for about 5% false positives
+    max_chars: 16000    # the classifier reads the first and last 8,000 characters of longer text
 ```
 
-The first detector is ProtectAI's `deberta-v3-base-prompt-injection-v2`
-(Apache-2.0, pinned revision), run on ONNX Runtime without PyTorch
-(`pip install mcp-customs[classifier]`). Scoring is CPU-bound and runs in
+Two detectors, which `layered` runs in order:
+
+- `hidden`: cheap checks for text a human reviewer would not see. Unicode
+  tag characters, direction overrides, invisible characters inside words,
+  Latin words with Cyrillic or Greek look-alike letters, and base64 that
+  decodes to readable text. They run in microseconds on every result, and
+  report spans, so `strip` removes just that part. When one is certain, the
+  classifier is skipped.
+- `classifier`: ProtectAI's `deberta-v3-base-prompt-injection-v2`
+  (Apache-2.0, pinned revision), run on ONNX Runtime without PyTorch
+  (`pip install mcp-customs[classifier]`). Scoring is CPU-bound and runs in
 worker threads, off the event loop. Its measured trade-off is in
 `bench/results/`: at the model's default threshold it flags 36% of
 legitimate tool output, and at a threshold that flags about 4% it catches

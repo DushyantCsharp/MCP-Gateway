@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 
 from mcp_customs.config import InjectionStageConfig, PolicyStageConfig, RedactionStageConfig, StageConfig
-from mcp_customs.detectors import Detector
+from mcp_customs.detectors import Calibrated, Detector
 from mcp_customs.detectors.hidden import HiddenTextDetector, LayeredDetector
 from mcp_customs.detectors.sensitive import SensitiveScanner
 from mcp_customs.pipeline.base import Pipeline, Stage
@@ -24,8 +24,9 @@ def build_stage(config: StageConfig) -> Stage:
 
                 classifier = OnnxClassifier(threads=1, max_chars=config.max_chars)
                 classifier.load()  # downloads the model on first start, and fails fast if it cannot
+                calibrated = Calibrated(classifier, config.classifier_threshold)
                 detector = (
-                    classifier if config.detector == "classifier" else LayeredDetector([detector, classifier])
+                    calibrated if config.detector == "classifier" else LayeredDetector([detector, calibrated])
                 )
             return InjectionStage(
                 detector, mode=config.mode, threshold=config.threshold, threads=config.threads
