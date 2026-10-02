@@ -136,9 +136,15 @@ stages:
   - type: injection
     detector: layered   # hidden | classifier | layered
     mode: flag          # block | flag | strip
-    threshold: 0.997    # chosen on the benchmark's dev split for about 5% false positives
+    threshold: 0.5      # on calibrated scores: every detector's own decision point sits at 0.5
+    classifier_threshold: 0.997  # the classifier's raw cut-off; this one was chosen on dev for ~5% false positives
     max_chars: 16000    # the classifier reads the first and last 8,000 characters of longer text
 ```
+
+Detectors score on different scales, so each is calibrated before they are
+combined: a detector's own decision point maps to 0.5, and `threshold` is set
+once, on that common scale. The hidden-text checks score 0.6 to 1.0 when they
+fire, so any finding of theirs acts at the default threshold.
 
 Two detectors, which `layered` runs in order:
 
@@ -155,8 +161,27 @@ worker threads, off the event loop. Its measured trade-off is in
 `bench/results/`: at the model's default threshold it flags 36% of
 legitimate tool output, and at a threshold that flags about 4% it catches
 about half the attacks. Until a better detector layer exists, run it in
-`flag` mode, not `block`. Every decision goes into the audit log and the
-span (`customs.injection.*`), so its false positives can be reviewed.
+`flag` mode (the default), not `block`. Every decision goes into the audit
+log and the span (`customs.injection.*`), so its false positives can be
+reviewed.
+
+**The character budget.** The classifier reads 512-token windows, so its cost
+grows with the length of a result. `max_chars` bounds it: longer text is cut
+to its first and last halves, where injected instructions usually sit, and
+the hidden-text checks still read all of it. Measured on the benchmark's 109
+samples longer than 2,000 characters (Apple M4, 5 threads):
+
+| `max_chars` | Median | Slowest | Of the 109 flagged |
+| --- | --- | --- | --- |
+| 16,000 (default) | 3.4 s | 11.5 s | 74 |
+| 8,000 | 1.9 s | 4.5 s | 69 |
+| 4,000 | 0.9 s | 1.8 s | 65 |
+| 2,000 | 0.4 s | 0.7 s | 60 |
+
+All 109 are legitimate output: no attack in the benchmark is longer than
+2,000 characters, so what a smaller budget costs in detection is not
+measured. What it gives up is plain: an instruction placed in the middle of a
+long result, past the budget, is never read by the classifier.
 
 ## Audit
 
