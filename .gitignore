@@ -23,3 +23,5 @@ customs.yaml
 .DS_Store
 .idea/
 .vscode/
+bench/datasets/external/
+bench/datasets/build/*.jsonl
