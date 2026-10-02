@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT / "bench" / "datasets"))
 sys.path.insert(0, str(ROOT / "bench" / "harness"))
 
 from build import fill_in_entries  # noqa: E402
-from detection import Scored, rates, wilson  # noqa: E402
+from detection import Scored, rates, threshold_for_fpr, wilson  # noqa: E402
 from schema import Label, Sample, read_jsonl, split_for, write_jsonl  # noqa: E402
 
 
@@ -74,3 +74,15 @@ def test_rates_count_flags_per_category_and_split() -> None:
     totals = [r for (group, _), r in by_group.items() if group == "all"]
     assert sum(r.n for r in totals) == 3
     assert sum(r.hits for r in totals) == 2
+
+
+def test_threshold_for_fpr_is_chosen_on_dev_only() -> None:
+    dev = [s for i in range(100) if (s := sample(f"d{i}", f"grp-{i}")).split == "dev"]
+    test = [s for i in range(100, 400) if (s := sample(f"t{i}", f"grp-{i}")).split == "test"]
+    benign = [Scored(s, (k + 1) / len(dev), 0.0) for k, s in enumerate(dev)]
+    benign += [Scored(s, 0.999, 0.0) for s in test]  # test scores must not move the threshold
+    threshold = threshold_for_fpr(benign, 0.10)
+    flagged = sum(item.score >= threshold for item in benign if item.sample.split == "dev")
+    assert flagged <= 0.10 * len(dev)
+    assert flagged >= 0.10 * len(dev) - 1
+    assert threshold_for_fpr(benign, 1.0) == 0.0

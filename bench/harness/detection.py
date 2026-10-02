@@ -106,6 +106,31 @@ def rates(scored: list[Scored], threshold: float, key: str) -> list[Rate]:
     return out
 
 
+def threshold_for_fpr(benign: list[Scored], max_fpr: float) -> float:
+    """The lowest threshold at which at most ``max_fpr`` of dev benign samples are flagged."""
+    scores = sorted((item.score for item in benign if item.sample.split == "dev"), reverse=True)
+    allowed = int(max_fpr * len(scores))
+    if allowed >= len(scores):
+        return 0.0
+    # Flag only scores strictly above the (allowed+1)-th highest benign score.
+    return min(1.0, scores[allowed] + 1e-9)
+
+
+def operating_points(
+    attacks: list[Scored], benign: list[Scored], targets: tuple[float, ...]
+) -> list[dict[str, Any]]:
+    points = []
+    for target in targets:
+        threshold = threshold_for_fpr(benign, target)
+        detected = [r for r in rates(attacks, threshold, "category") if r.group == "all"]
+        flagged = [r for r in rates(benign, threshold, "category") if r.group == "all"]
+        by_split = {r.split: r for r in detected}, {r.split: r for r in flagged}
+        points.append(
+            {"target_dev_fpr": target, "threshold": threshold, "detection": by_split[0], "fpr": by_split[1]}
+        )
+    return points
+
+
 def environment(detector: Detector) -> dict[str, Any]:
     git = shutil.which("git") or "git"
     commit = subprocess.run([git, "rev-parse", "--short", "HEAD"], capture_output=True, text=True, cwd=ROOT)  # noqa: S603
@@ -175,6 +200,22 @@ def markdown(env: dict[str, Any], threshold: float, attacks: list[Scored], benig
     quantiles = statistics.quantiles(seconds, n=100) if len(seconds) > 1 else [seconds[0]] * 99
     lines += [
         "",
+        "## Thresholds chosen on dev",
+        "",
+        "The default threshold above is the model's own. Here the threshold is instead chosen on the dev "
+        "split's benign samples for a target false-positive rate, then applied unchanged to test.",
+        "",
+        "| Target dev FPR | Threshold | Test detection | Test FPR | Dev detection | Dev FPR |",
+        "| ---: | ---: | --- | --- | --- | --- |",
+    ]
+    for point in operating_points(attacks, benign, (0.01, 0.05, 0.10, 0.20)):
+        detection, fpr = point["detection"], point["fpr"]
+        lines.append(
+            f"| {point['target_dev_fpr']:.0%} | {point['threshold']:.4f} | {percent(detection['test'])} | "
+            f"{percent(fpr['test'])} | {percent(detection['dev'])} | {percent(fpr['dev'])} |"
+        )
+    lines += [
+        "",
         "## Cost",
         "",
         f"Per sample: p50 {statistics.median(seconds):.1f} ms, p99 {quantiles[98]:.1f} ms, "
@@ -203,17 +244,38 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--threads", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     parser.add_argument("--out", type=Path, default=ROOT / "bench" / "results")
+    parser.add_argument(
+        "--scores",
+        type=Path,
+        help="reuse the scores in an earlier results JSON instead of running the detector",
+    )
     args = parser.parse_args()
 
     attacks = list(read_jsonl(DATASETS / "build" / "attack.jsonl"))
     benign = list(read_jsonl(DATASETS / "build" / "benign.jsonl"))
-    detector = make_detector(args.detector, args.threads)
-    print(f"scoring {len(attacks)} attack and {len(benign)} benign samples with {detector.name}", flush=True)
-    scored_attacks, scored_benign = score(detector, attacks), score(detector, benign)
-    env = environment(detector)
+    if args.scores:
+        earlier = json.loads(args.scores.read_text())
+        if (
+            earlier["environment"]["data"]["files"]
+            != json.loads((DATASETS / "build" / "manifest.json").read_text())["files"]
+        ):
+            raise SystemExit("those scores were measured on different data; rebuild or re-run the detector")
+        cached = {row["id"]: (row["score"], row.get("ms", 0.0) / 1000) for row in earlier["scores"]}
+        scored_attacks = [Scored(s, *cached[s.id]) for s in attacks]
+        scored_benign = [Scored(s, *cached[s.id]) for s in benign]
+        env = {**earlier["environment"], "rescored_from": args.scores.name}
+        detector_name = env["detector"]
+    else:
+        detector = make_detector(args.detector, args.threads)
+        print(
+            f"scoring {len(attacks)} attack and {len(benign)} benign samples with {detector.name}", flush=True
+        )
+        scored_attacks, scored_benign = score(detector, attacks), score(detector, benign)
+        env = environment(detector)
+        detector_name = detector.name
 
     args.out.mkdir(parents=True, exist_ok=True)
-    stem = f"detection-{env['date'][:10]}-{detector.name}"
+    stem = f"detection-{env['date'][:10]}-{detector_name}"
     (args.out / f"{stem}.md").write_text(markdown(env, args.threshold, scored_attacks, scored_benign))
     payload = {
         "environment": env,
@@ -221,7 +283,13 @@ def main() -> None:
         "detection": [asdict(r) for r in rates(scored_attacks, args.threshold, "variant")],
         "false_positives": [asdict(r) for r in rates(scored_benign, args.threshold, "category")],
         "scores": [
-            {"id": i.sample.id, "label": i.sample.label, "split": i.sample.split, "score": round(i.score, 5)}
+            {
+                "id": i.sample.id,
+                "label": i.sample.label,
+                "split": i.sample.split,
+                "score": round(i.score, 5),
+                "ms": round(i.seconds * 1000, 2),
+            }
             for i in [*scored_attacks, *scored_benign]
         ],
     }
