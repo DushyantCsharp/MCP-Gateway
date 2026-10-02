@@ -36,6 +36,9 @@ dependencies = [
 customs = "mcp_customs.cli:app"
 
 [dependency-groups]
+bench = [
+    "agentdojo==0.1.35",
+]
 dev = [
     "customs-demo",
     "hypothesis>=6",
