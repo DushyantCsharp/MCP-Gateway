@@ -1,0 +1,102 @@
+[project]
+name = "mcp-customs"
+version = "0.0.1"
+description = "A security and governance gateway for MCP: policy, injection detection, approvals, budgets and audit on every tool call."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+authors = [{ name = "Dushyant Nana" }]
+keywords = ["mcp", "model-context-protocol", "agents", "security", "gateway", "proxy"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: AsyncIO",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+dependencies = [
+    "fastapi>=0.142.2",
+    "httpx2>=2.13.1",
+    "mcp>=2.2,<3",
+    "pydantic>=2.13.5",
+    "pyyaml>=6.0.3",
+    "typer>=0.27.2",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+customs = "mcp_customs.cli:app"
+
+[dependency-groups]
+dev = [
+    "customs-demo",
+    "mypy>=2.4",
+    "pre-commit>=4.6",
+    "pytest>=9.1",
+    "pytest-cov>=7.1",
+    "ruff>=0.16.10",
+    "types-pyyaml>=6.0.12",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.workspace]
+members = ["demo"]
+
+[tool.uv.sources]
+customs-demo = { workspace = true }
+
+# --- lint -------------------------------------------------------------------
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "demo/src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "N", "B", "UP", "SIM", "C4", "PIE", "RET", "PTH",
+    "ASYNC", "S", "RUF", "PT", "TRY", "PERF", "FURB", "LOG", "G",
+]
+ignore = [
+    "TRY003",  # long messages on raised exceptions are fine
+    "S104",    # binding 0.0.0.0 is deliberate inside containers
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "PLR2004"]
+
+# --- types ------------------------------------------------------------------
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
+mypy_path = ["src", "demo/src"]
+files = ["src", "demo/src", "tests"]
+
+# --- tests ------------------------------------------------------------------
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["--strict-markers", "--strict-config", "-ra"]
+markers = [
+    "contract: drives a real MCP client through a running gateway against real upstream servers",
+]
+filterwarnings = ["error", "ignore::DeprecationWarning:websockets.*", "ignore::DeprecationWarning:uvicorn.*"]
+xfail_strict = true
+
+[tool.coverage.run]
+branch = true
+source = ["mcp_customs"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "\\.\\.\\."]

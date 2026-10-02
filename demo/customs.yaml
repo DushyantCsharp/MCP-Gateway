@@ -1,0 +1,10 @@
+# Gateway configuration for the demo Compose stack.
+server:
+  host: 0.0.0.0
+  port: 8000
+
+upstreams:
+  workspace:
+    url: http://workspace:8001/mcp
+  finance:
+    url: http://finance:8002/mcp

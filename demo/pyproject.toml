@@ -1,0 +1,19 @@
+[project]
+name = "customs-demo"
+version = "0.0.1"
+description = "Sample MCP servers and a scripted agent used by the mcp-customs demo, tests and benchmark."
+requires-python = ">=3.12"
+license = "Apache-2.0"
+dependencies = [
+    "mcp>=2.2,<3",
+    "uvicorn[standard]>=0.54.0",
+]
+
+[project.scripts]
+customs-demo-workspace = "customs_demo.workspace_server:main"
+customs-demo-finance = "customs_demo.finance_server:main"
+customs-demo-agent = "customs_demo.agent:main"
+
+[build-system]
+requires = ["uv_build>=0.11.14,<0.13"]
+build-backend = "uv_build"

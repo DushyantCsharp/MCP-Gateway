@@ -1,0 +1,61 @@
+# The demo stack: two sample MCP servers with the gateway in front.
+#
+#   docker compose -f demo/compose.yaml up --build --wait
+#   docker compose -f demo/compose.yaml run --rm agent
+#
+# The servers are also published on localhost:8001 and :8002, so the same
+# agent can be pointed at them directly to compare. If those ports are taken,
+# set CUSTOMS_PORT, WORKSPACE_PORT or FINANCE_PORT.
+
+name: mcp-customs-demo
+
+x-demo-image: &demo-image
+  build:
+    context: ..
+    dockerfile: demo/Dockerfile
+  image: mcp-customs-demo:dev
+
+x-healthcheck: &healthcheck
+  interval: 3s
+  timeout: 3s
+  retries: 10
+  start_period: 3s
+
+services:
+  workspace:
+    <<: *demo-image
+    command: ["customs-demo-workspace", "--port", "8001"]
+    ports: ["127.0.0.1:${WORKSPACE_PORT:-8001}:8001"]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/healthz', timeout=2)"]
+
+  finance:
+    <<: *demo-image
+    command: ["customs-demo-finance", "--port", "8002"]
+    ports: ["127.0.0.1:${FINANCE_PORT:-8002}:8002"]
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/healthz', timeout=2)"]
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: mcp-customs:dev
+    volumes:
+      - ./customs.yaml:/etc/customs/customs.yaml:ro
+    ports: ["127.0.0.1:${CUSTOMS_PORT:-8000}:8000"]
+    depends_on:
+      workspace: {condition: service_healthy}
+      finance: {condition: service_healthy}
+
+  agent:
+    <<: *demo-image
+    profiles: ["agent"]
+    command: ["customs-demo-agent"]
+    environment:
+      WORKSPACE_MCP_URL: http://gateway:8000/mcp/workspace
+      FINANCE_MCP_URL: http://gateway:8000/mcp/finance
+    depends_on:
+      gateway: {condition: service_healthy}
