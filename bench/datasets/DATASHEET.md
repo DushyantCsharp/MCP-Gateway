@@ -17,7 +17,7 @@ and is useless. The benign side is deliberately hard for that reason.
 | `tool_hijack` | attack | 1,020 (510 base, 510 enhanced) | 30 instructions | InjecAgent "direct harm" cases |
 | `exfiltration` | attack | 1,088 (544 base, 544 enhanced) | 32 instructions | InjecAgent "data stealing" cases |
 | `paired` | benign | one per line in `benign/fill-in.md` | 17 templates | InjecAgent's tool-output templates, slot filled with ordinary hand-written content |
-| `security_docs` | benign | 102 | 5 documents | paragraphs of this project's documentation, which discusses prompt injection, tokens and exfiltration |
+| `security_docs` | benign | 102 | 5 documents | paragraphs of this project's documentation as of commit `d2edc42`, which discusses prompt injection, tokens and exfiltration |
 | `code` | benign | 78 | 17 modules | CPython standard-library functions whose source contains words such as `ignore`, `password`, `send`, `execute` |
 | `long_outputs` | benign | 90 | 90 | seeded synthetic ledgers, search results and web-server logs |
 

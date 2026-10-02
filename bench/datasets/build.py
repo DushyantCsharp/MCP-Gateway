@@ -122,9 +122,21 @@ DOCS = [
 ]
 
 
+DOCS_REF = "d2edc42"
+"""The commit the documents are read at. The docs keep changing; the dataset must not change with them."""
+
+
+def doc_at(ref: str, relative: str) -> str:
+    git = shutil.which("git") or "git"
+    shown = subprocess.run(  # noqa: S603 - fixed arguments
+        [git, "show", f"{ref}:{relative}"], capture_output=True, text=True, check=True, cwd=ROOT
+    )
+    return shown.stdout
+
+
 def doc_samples() -> Iterator[Sample]:
     for relative in DOCS:
-        paragraphs = re.split(r"\n\s*\n", (ROOT / relative).read_text(encoding="utf-8"))
+        paragraphs = re.split(r"\n\s*\n", doc_at(DOCS_REF, relative))
         for index, paragraph in enumerate(p.strip() for p in paragraphs):
             if len(paragraph) >= 200:
                 yield Sample(
@@ -313,6 +325,7 @@ def main() -> None:
             "injecagent_commit": commit,
             "fill_in_sha256": sha256_file(FILL_IN),
             "python_stdlib": platform.python_version(),
+            "docs_ref": DOCS_REF,
             "seed": SEED,
         },
         "files": {name: sha256_file(OUT / name) for name in ("attack.jsonl", "benign.jsonl")},

@@ -404,6 +404,14 @@ the threshold chosen on dev for about 5% false positives, it catches 52.9%
    install.
 10. `tokenizers` 0.23 requires `huggingface-hub` below 2.0. The extra pins
     only a floor and lets the resolver choose.
+11. **The benchmark drifted with the docs.** The `security_docs` class was
+    built from the repository's current documentation, so writing up the
+    results grew it from 102 to 121 samples and changed its hash. A rebuild
+    at a later commit would have scored a different dataset under the same
+    name. The build now reads the documents with `git show` at a pinned
+    commit, and the manifest records it. A rebuild reproduces the published
+    data's hashes exactly. Lesson: anything generated from the repository
+    must be pinned like an external source.
 
 ## Follow-ups
 
