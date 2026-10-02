@@ -156,7 +156,19 @@ class PolicyStageConfig(_Model):
     file: ConfigPath
 
 
-type StageConfig = PolicyStageConfig
+class InjectionStageConfig(_Model):
+    """Inspect tool results for prompt injection before the agent reads them."""
+
+    type: Literal["injection"]
+    detector: Literal["classifier"] = "classifier"
+    """``classifier``: ProtectAI's DeBERTa prompt-injection model on ONNX Runtime (``[classifier]`` extra)."""
+    mode: Literal["block", "flag", "strip"] = "block"
+    threshold: Annotated[float, Field(ge=0, le=1)] = 0.5
+    threads: Annotated[int, Field(ge=1, le=64)] = 2
+    """Detector threads; scoring is CPU-bound and runs off the event loop."""
+
+
+type StageConfig = Annotated[PolicyStageConfig | InjectionStageConfig, Field(discriminator="type")]
 
 
 class AuditConfig(_Model):

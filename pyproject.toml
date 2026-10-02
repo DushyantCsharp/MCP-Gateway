@@ -32,12 +32,21 @@ dependencies = [
     "uvicorn[standard]>=0.54.0",
 ]
 
+[project.optional-dependencies]
+classifier = [
+    "huggingface-hub>=0.30",
+    "numpy>=2",
+    "onnxruntime>=1.30",
+    "tokenizers>=0.23",
+]
+
 [project.scripts]
 customs = "mcp_customs.cli:app"
 
 [dependency-groups]
 bench = [
     "agentdojo==0.1.35",
+    "mcp-customs[classifier]",
 ]
 dev = [
     "customs-demo",
@@ -94,7 +103,7 @@ files = ["src", "demo/src", "tests", "bench/harness", "bench/datasets"]
 exclude = ["bench/datasets/external/"]
 
 [[tool.mypy.overrides]]
-module = ["docker", "docker.*"]
+module = ["docker", "docker.*", "onnxruntime", "onnxruntime.*"]
 ignore_missing_imports = true
 
 # --- tests ------------------------------------------------------------------
