@@ -65,8 +65,9 @@ customs-demo = { workspace = true }
 
 [tool.ruff]
 line-length = 110
+extend-exclude = ["bench/datasets/external"]
 target-version = "py312"
-src = ["src", "demo/src", "tests", "bench/harness"]
+src = ["src", "demo/src", "tests", "bench/harness", "bench/datasets"]
 
 [tool.ruff.lint]
 select = [
@@ -88,8 +89,9 @@ python_version = "3.12"
 strict = true
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
-mypy_path = ["src", "demo/src"]
-files = ["src", "demo/src", "tests", "bench/harness"]
+mypy_path = ["src", "demo/src", "bench/datasets"]
+files = ["src", "demo/src", "tests", "bench/harness", "bench/datasets"]
+exclude = ["bench/datasets/external/"]
 
 [[tool.mypy.overrides]]
 module = ["docker", "docker.*"]
