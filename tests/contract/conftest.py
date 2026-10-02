@@ -66,10 +66,15 @@ def make_config(upstreams: Mapping[str, str | dict[str, Any]], **sections: Any) 
 
 
 @contextmanager
-def running_gateway(config: GatewayConfig, stages: list[Stage] | None = None) -> Iterator[Gateway]:
-    """Serve a gateway. ``stages`` replaces the pipeline; without it, ``config.stages`` builds one."""
+def running_gateway(
+    config: GatewayConfig, stages: list[Stage] | None = None, **app_options: Any
+) -> Iterator[Gateway]:
+    """Serve a gateway. ``stages`` replaces the pipeline; without it, ``config.stages`` builds one.
+
+    ``app_options`` go to :func:`create_app` (``telemetry``, ``audit_store``).
+    """
     pipeline = Pipeline(stages) if stages is not None else None
-    with serve_in_thread(create_app(config, pipeline=pipeline)) as base:
+    with serve_in_thread(create_app(config, pipeline=pipeline, **app_options)) as base:
         yield Gateway(base)
 
 

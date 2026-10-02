@@ -21,6 +21,10 @@ dependencies = [
     "fastapi>=0.142.2",
     "httpx2>=2.13.1",
     "mcp>=2.2,<3",
+    "opentelemetry-exporter-otlp-proto-http>=1.45,<2",
+    "opentelemetry-sdk>=1.45,<2",
+    "opentelemetry-semantic-conventions>=0.66b0",
+    "psycopg[binary]>=3.3",
     "pydantic>=2.13.5",
     "pyjwt[crypto]>=2.10",
     "pyyaml>=6.0.3",
@@ -40,6 +44,7 @@ dev = [
     "pytest>=9.1",
     "pytest-cov>=7.1",
     "ruff>=0.16.10",
+    "testcontainers[postgres]>=4.15",
     "types-pyyaml>=6.0.12",
 ]
 
@@ -58,7 +63,7 @@ customs-demo = { workspace = true }
 [tool.ruff]
 line-length = 110
 target-version = "py312"
-src = ["src", "demo/src", "tests"]
+src = ["src", "demo/src", "tests", "bench/harness"]
 
 [tool.ruff.lint]
 select = [
@@ -81,7 +86,11 @@ strict = true
 warn_unreachable = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 mypy_path = ["src", "demo/src"]
-files = ["src", "demo/src", "tests"]
+files = ["src", "demo/src", "tests", "bench/harness"]
+
+[[tool.mypy.overrides]]
+module = ["docker", "docker.*"]
+ignore_missing_imports = true
 
 # --- tests ------------------------------------------------------------------
 

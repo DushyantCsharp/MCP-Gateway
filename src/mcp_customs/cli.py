@@ -1,5 +1,6 @@
 """Command line: run the gateway, check configuration and policy, mint development tokens."""
 
+import asyncio
 import json
 import logging
 import os
@@ -9,11 +10,14 @@ from typing import Annotated, Any
 
 import httpx2
 import jwt
+import psycopg
 import typer
 import uvicorn
 
 from mcp_customs import __version__
 from mcp_customs.app import create_app
+from mcp_customs.audit import AuditStoreError, Hasher
+from mcp_customs.audit.verify import verify_database
 from mcp_customs.auth import JwtAuthenticator
 from mcp_customs.auth.identity import Identity, parse_grants
 from mcp_customs.config import ConfigError, GatewayConfig, load_config
@@ -97,6 +101,48 @@ def check_config(config: ConfigOption = Path("customs.yaml")) -> None:
         typer.echo(f"  auth: JWT ({source}), audience {jwt_config.audience!r}")
     for stage in settings.stages:
         typer.echo(f"  stage: {stage.type} ({stage.file})")
+    if settings.audit is None:
+        typer.echo("  audit: none (calls are not recorded)")
+    else:
+        keyed = "HMAC-SHA256" if settings.audit.key else "SHA-256, no key"
+        typer.echo(f"  audit: Postgres, {keyed}, {'durable' if settings.audit.durable else 'asynchronous'}")
+    if settings.telemetry is not None:
+        typer.echo(f"  telemetry: OTLP to {settings.telemetry.otlp_endpoint or 'the OTEL_* endpoint'}")
+
+
+@app.command("verify-audit")
+def verify_audit(
+    dsn_env: Annotated[
+        str, typer.Option(help="Environment variable holding the Postgres DSN.")
+    ] = "CUSTOMS_AUDIT_DSN",
+    key_env: Annotated[
+        str | None, typer.Option(help="Environment variable holding the chain's HMAC key, if it has one.")
+    ] = None,
+    chain: Annotated[str | None, typer.Option(help="Verify one chain only.")] = None,
+) -> None:
+    """Recompute every link of the audit log. Exit status: 0 intact, 1 broken, 2 on errors."""
+    dsn = os.environ.get(dsn_env)
+    if not dsn:
+        raise _fail(f"set {dsn_env} to the audit database's connection string")
+    key = os.environ.get(key_env) if key_env else None
+    if key_env and not key:
+        raise _fail(f"{key_env} is not set")
+    try:
+        reports = asyncio.run(verify_database(dsn, Hasher(key.encode() if key else None), chain))
+    except (AuditStoreError, OSError) as exc:
+        raise _fail(str(exc)) from exc
+    except psycopg.Error as exc:  # unreachable database, missing table, bad credentials
+        raise _fail(f"cannot read the audit log: {exc}") from exc
+    if not reports:
+        typer.echo("no audit rows" + (f" for chain {chain!r}" if chain else ""))
+        return
+    for report in reports:
+        status = "ok" if report.ok else f"BROKEN: {report.problem}"
+        typer.echo(
+            f"{report.chain}: {report.rows} rows, head {report.head.seq} {report.head.hash[:16]}... {status}"
+        )
+    if not all(report.ok for report in reports):
+        raise typer.Exit(code=1)
 
 
 @app.command("check-policy")

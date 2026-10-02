@@ -22,17 +22,18 @@ client sends is what the server receives, unless a stage changes it.
 │ 7. routing      Mcp-Method / Mcp-Name agree with body → else 400│
 │ 8. pipeline     client stages (policy, ...): continue / replace │
 │                 / respond                                       │
-│ 9. forward      filtered headers, original bytes                │
+│ 9. audit        request row committed (durable) → else 503      │
+│10. forward      filtered headers, original bytes, traceparent   │
 └───────────────────────────────┬─────────────────────────────────┘
                                 ▼
                        upstream MCP server
                                 │  application/json  or  text/event-stream
 ┌───────────────────────────────▼─────────────────────────────────┐
-│10. relay        JSON body, or SSE event by event                │
-│11. validate     strict JSON-RPC; answers match the request id   │
-│12. pipeline     server stages (listing filter, ...): continue / │
+│11. relay        JSON body, or SSE event by event                │
+│12. validate     strict JSON-RPC; answers match the request id   │
+│13. pipeline     server stages (listing filter, ...): continue / │
 │                 replace                                         │
-│13. return       original bytes unless replaced; session id      │
+│14. return       original bytes unless replaced; session id      │
 │                 re-bound to the agent                           │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -75,6 +76,60 @@ Listings are filtered so a model is never offered what it may not call. The
 rules and their semantics are in the [policy reference](policy-reference.md).
 The engine sits behind a small interface (`PolicyEngine`), so an OPA or Cedar
 adapter could replace it.
+
+## Audit
+
+Every exchange leaves events in an append-only, hash-chained Postgres table
+(`customs_audit`). A `request` event (who, what, where, the decision and the
+deciding rule) is written *before* a request is forwarded. In durable mode,
+the default, the gateway waits for that row to commit, so if the log cannot
+be written the call is refused with a `503` rather than run unaudited. A
+`result` event (outcome, status, digest of the answer, duration) follows when
+the exchange completes. Notifications, GET streams and DELETEs leave
+`message` and `transport` events. Requests refused before they could be read
+(bad token, unknown upstream or session, malformed body) leave `rejected`
+events, which are attack signals. Arguments are stored only as a SHA-256
+digest unless `record_arguments` is on.
+
+Writes are group-committed: one writer task per gateway hashes queued events
+onto the chain and commits each batch in a single transaction, so under load
+many calls share one commit. Each row's hash covers the chain name, sequence
+number, previous hash and canonical event JSON; with `audit.key` it is
+HMAC-SHA256. Changing, reordering or deleting a row breaks every later link,
+and `customs verify-audit` reports the first break. The table refuses
+`UPDATE`, `DELETE` and `TRUNCATE` through triggers. Each gateway holds an
+advisory lock on its chain, and the primary key `(chain, seq)` makes forks
+unwritable.
+
+What it is not: a ledger. Someone with database access and the key (or any
+database access, without a key) can rewrite a chain consistently, and
+cutting off the newest rows is invisible unless the head is recorded
+elsewhere. The gateway logs the head when the chain opens and closes; ship
+those logs off the host.
+
+## Telemetry
+
+Each exchange is a server span named after the MCP method and target
+(`tools/call transfer_funds`), with MCP and GenAI semantic-convention
+attributes (`mcp.method.name`, `mcp.protocol.version`, `mcp.session.id`,
+`jsonrpc.request.id`, `gen_ai.operation.name`, `gen_ai.tool.name`) plus the
+gateway's own (`customs.agent`, `customs.decision`). Conventions are pinned
+to schema 1.44.0. Each pipeline stage gets a child span carrying its
+annotations (`customs.policy.decision`, `customs.policy.rule`), and the
+upstream exchange gets a client span that ends when its body or stream does.
+Spans go out over OTLP/HTTP (Jaeger in the demo).
+
+The gateway joins the caller's trace from `params._meta.traceparent`
+(SEP-414, as the MCP SDKs send it), falling back to the HTTP `traceparent`
+header. It does not rewrite `_meta`, so the upstream server's span is a
+sibling of the gateway's under the caller's span rather than its child. A
+`traceparent` header carries the gateway's upstream span for HTTP-level
+instrumentation. Audit rows carry the `trace_id`, so a row leads to its
+trace and a trace to its rows.
+
+At start-up the gateway logs what it enforces, and warns about what is off
+(no authentication, no stages, no audit). A gateway that silently runs
+without its policy is the failure this exists to prevent.
 
 ## Two protocol eras, one proxy
 
@@ -130,6 +185,7 @@ check each one:
 | Unknown upstream | `404`, JSON-RPC `-32600` |
 | Foreign `Origin` | `403`, JSON-RPC `-32600` |
 | Session id not bound to this agent | `404`, JSON-RPC `-32084` |
+| Durable audit row could not be committed in time | `503`, JSON-RPC `-32085`; the call is not made |
 | Tool call denied by policy | tool result with `isError: true` |
 | Other request denied by policy | `200`, JSON-RPC `-32090` |
 | Body over `limits.max_request_bytes` | `413` |
@@ -165,9 +221,15 @@ return `Replace(...)` to rewrite it.
 
 ## Known limitations
 
-- No injection detection, data redaction, approvals, budgets or audit log
-  yet. Identity and policy hold for what they cover. The gateway does not yet
-  look inside tool results for injected instructions.
+- No injection detection, data redaction, approvals or budgets yet.
+  Identity, policy and audit hold for what they cover. The gateway does not
+  yet look inside tool results for injected instructions.
+- Durable audit covers the `request` event. `result` events are written
+  after the response, so a crash between the two leaves a request without
+  its outcome.
+- One gateway process handles roughly 1,000 to 1,500 calls a second
+  (`bench/README.md`). Running several workers or replicas needs one audit
+  chain each (`audit.chain`); two processes on one chain refuse to start.
 - JSON-RPC batches are refused. Batching was removed from MCP in 2025-06-18
   and is not part of the stateless revision.
 - A client that disconnects before the upstream has sent response headers
