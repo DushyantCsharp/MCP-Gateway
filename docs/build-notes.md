@@ -731,6 +731,60 @@ against a live agent with the gateway off vs on), was not built, so its
    contract tests drive the full chain in both eras: an SDK client over stdio,
    through `customs stdio` and the gateway, to a local server over stdio.
 
+## Weekend 8: v0.1 (2026-10-03)
+
+**Result:** the "done when" (a stranger can clone, run and reproduce the
+numbers in under 15 minutes) was tested as a stranger would do it: a fresh
+clone in an empty directory, `uv sync --group bench`, then
+`bench/reproduce.py`. It took 12.6 minutes on the M4, with the classifier
+already cached and another project holding the machine's load average
+between 25 and 53. A first run also downloads the 740 MB model. The
+rebuilt benchmark was byte-identical to the published one; detection matched
+exactly (440 of 544 attacks, 36 of 100 false positives on the test split, and
+the dev split too); and budgets let nothing past a limit with Redis.
+
+### Reproducing
+
+1. **A rerun must not overwrite what it checks.** Every harness writes to an
+   `--out` directory, and `reproduce.py` uses `bench/results/reproduced/`
+   (git-ignored), then compares that with the published files.
+
+2. **A shallow clone cannot rebuild the benchmark.** Its `security_docs` class
+   reads the documents at a pinned commit with `git show` (Weekend 4,
+   finding 11), so a `--depth 1` clone lacks it. The script checks first and
+   says what to run.
+
+3. **Detection is deterministic; latency is not.** The ONNX classifier gave
+   the same counts on a different checkout and under heavy load, so the
+   script allows a difference of only two samples. Latency under that load
+   was nothing like the published numbers (pass-through overhead 19 ms
+   instead of 3), so the script reports latency but does not judge it.
+   Published latency names its machine and its load.
+
+4. **Budget slips with in-process counters vary by timing.** Two replicas let
+   79,657.59 through in the published run and 79,667.08 in this one. The
+   number that must reproduce, zero with Redis, did.
+
+### Releasing
+
+5. **Check what a package ships.** The build plan sits in the repository root,
+   kept out of git because it mentions an employer and career notes, and a
+   build backend need not honour `.git/info/exclude`. The source package was
+   listed before anything was published: 65 files, the package and its
+   metadata only.
+
+6. **A release without new third-party actions.** The release workflow runs
+   only on a version tag. It checks the tag matches `pyproject.toml`, builds
+   with uv, creates the release with `gh` from the changelog, and pushes the
+   image with `docker`. PyPI uses trusted publishing (`uv publish`), so no
+   token is stored, and it is off until the owner sets it up.
+
+7. **Not done by the build.** Tagging v0.1.0 and publishing wait for the
+   owner. The demo video needs a person with a screen recorder
+   (`docs/demo-walkthrough.md` is its script). The CV line in the plan quotes
+   an attack-success number that does not exist (Weekend 7), so it needs
+   rewriting around the numbers that do.
+
 ## Follow-ups
 
 | Item | Why | When |
@@ -763,3 +817,5 @@ against a live agent with the gateway off vs on), was not built, so its
 | End-to-end attack success rate, gateway off vs on, and its nightly CI job | The plan's headline metric; not built (Weekend 7, findings 1 and 2) | Open |
 | Stateless-era (2026-07-28) clients for local upstreams | They speak only the handshake era today; clients in `auto` mode fall back | After v0.1 |
 | Test local upstreams on Windows | Process handling is written for POSIX and tested on macOS and Linux | Before v0.1 |
+| Tag v0.1.0 and publish (GitHub release, ghcr.io image; PyPI once trusted publishing is set up) | The release workflow is ready; publishing is the owner's decision | Now |
+| Record the demo video from `docs/demo-walkthrough.md` | Needs a person and a screen recorder | Now |
