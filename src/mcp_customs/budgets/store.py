@@ -165,10 +165,17 @@ class RedisBudgetStore:
     """Counters shared by every gateway that uses the same Redis. Redis must not evict keys
     (``maxmemory-policy noeviction``): an evicted counter forgets what was spent."""
 
-    def __init__(self, url: str, *, prefix: str = "customs:budget:") -> None:
+    def __init__(
+        self, url: str, *, prefix: str = "customs:budget:", max_connections: int = 64, timeout_s: float = 5.0
+    ) -> None:
         import redis.asyncio as redis
 
-        self._client: Any = redis.Redis.from_url(url)
+        # A blocking pool: under a burst, calls wait for a free connection instead of failing
+        # (a plain pool raises "Too many connections", and the stage would refuse the call).
+        self._pool: Any = redis.BlockingConnectionPool.from_url(
+            url, max_connections=max_connections, timeout=timeout_s
+        )
+        self._client: Any = redis.Redis(connection_pool=self._pool)
         self._script: Any = self._client.register_script(_CHARGE)
         self._prefix = prefix
 
@@ -182,6 +189,7 @@ class RedisBudgetStore:
 
     async def close(self) -> None:
         await self._client.aclose()
+        await self._pool.disconnect()
 
     async def charge(self, charges: Sequence[Charge], member: str) -> ChargeResult:
         import redis

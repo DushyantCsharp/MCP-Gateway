@@ -79,6 +79,23 @@ async def test_no_charge_slips_past_a_limit_under_contention(redis_server: str) 
     assert admitted == 50
 
 
+async def test_a_burst_waits_for_connections_rather_than_failing(redis_server: str) -> None:
+    """More concurrent calls than pooled connections: they queue, and every one is decided."""
+    store = RedisBudgetStore(redis_server, prefix=f"burst:{uuid.uuid4().hex}:", max_connections=2)
+    await store.open()
+    results = []
+
+    async def one(n: int) -> None:
+        results.append(await store.charge([charge("k", limit=40)], f"call-{n}"))
+
+    async with anyio.create_task_group() as tasks:
+        for n in range(100):
+            tasks.start_soon(one, n)
+    await store.close()
+    assert sum(result.charged for result in results) == 40
+    assert len(results) == 100
+
+
 async def test_an_unreachable_redis_fails_loudly() -> None:
     store = RedisBudgetStore("redis://127.0.0.1:1/0")
     with pytest.raises(BudgetStoreError):
