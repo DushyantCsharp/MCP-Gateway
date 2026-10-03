@@ -297,8 +297,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--redis", help="Redis URL; default: a throwaway container")
     parser.add_argument("--force", action="store_true", help="overwrite today's results")
+    parser.add_argument(
+        "--out", type=Path, default=ROOT / "bench" / "results", help="directory for the results"
+    )
     args = parser.parse_args()
-    out = ROOT / "bench" / "results" / f"budget-v{VERSION}-{datetime.now(UTC):%Y-%m-%d}"
+    args.out.mkdir(parents=True, exist_ok=True)
+    out = args.out / f"budget-v{VERSION}-{datetime.now(UTC):%Y-%m-%d}"
     if out.with_suffix(".md").exists() and not args.force:
         raise SystemExit(f"{out}.md exists; pass --force to replace it")
     env = environment()  # before measuring: the commit recorded is the code that runs
