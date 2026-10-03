@@ -160,15 +160,58 @@ class InjectionStageConfig(_Model):
     """Inspect tool results for prompt injection before the agent reads them."""
 
     type: Literal["injection"]
-    detector: Literal["classifier"] = "classifier"
-    """``classifier``: ProtectAI's DeBERTa prompt-injection model on ONNX Runtime (``[classifier]`` extra)."""
-    mode: Literal["block", "flag", "strip"] = "block"
+    detector: Literal["classifier", "hidden", "layered"] = "layered"
+    """``hidden``: the cheap checks for text a reader cannot see; ``classifier``: ProtectAI's DeBERTa
+    prompt-injection model on ONNX Runtime (``[classifier]`` extra); ``layered``: both, cheap first."""
+    mode: Literal["block", "flag", "strip"] = "flag"
+    """``flag`` by default: the classifier's measured false-positive rate makes ``block`` unsafe unless
+    ``classifier_threshold`` is raised (see ``bench/results``)."""
     threshold: Annotated[float, Field(ge=0, le=1)] = 0.5
+    """On calibrated scores: 0.5 means a detector is at its own decision point."""
+    classifier_threshold: Annotated[float, Field(gt=0, le=1)] = 0.5
+    """The classifier's own decision point. 0.5 is the model's; about 0.997 gave 4% false positives on
+    the benchmark's test split, at about half the detection rate."""
     threads: Annotated[int, Field(ge=1, le=64)] = 2
     """Detector threads; scoring is CPU-bound and runs off the event loop."""
+    max_chars: Annotated[int, Field(ge=1000)] | None = 16_000
+    """The classifier reads at most this many characters of one text (the first and last halves); the
+    cheap checks always read all of it. Bounds the cost of very long results. ``null`` reads everything."""
 
 
-type StageConfig = Annotated[PolicyStageConfig | InjectionStageConfig, Field(discriminator="type")]
+class RedactionStageConfig(_Model):
+    """Keep secrets and personal data from crossing the gateway."""
+
+    type: Literal["redaction"]
+    mode: Literal["redact", "flag", "block"] = "redact"
+    requests: list[str] = Field(default_factory=lambda: ["secrets"])
+    """Kinds scrubbed from tool and prompt arguments: ``secrets``, ``pii`` or individual kinds."""
+    responses: list[str] = Field(default_factory=lambda: ["secrets", "pii"])
+    """Kinds scrubbed from what tools, resources and prompts return."""
+    allow: list[str] = Field(default_factory=list)
+    """Regular expressions for values never redacted, such as internal addresses (``.*@acme\\.example``)."""
+
+    @field_validator("requests", "responses")
+    @classmethod
+    def _known_kinds(cls, names: list[str]) -> list[str]:
+        from mcp_customs.detectors.sensitive import expand
+
+        expand(names)
+        return names
+
+    @field_validator("allow")
+    @classmethod
+    def _compiles(cls, patterns: list[str]) -> list[str]:
+        for pattern in patterns:
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"invalid allow pattern {pattern!r}: {exc}") from exc
+        return patterns
+
+
+type StageConfig = Annotated[
+    PolicyStageConfig | InjectionStageConfig | RedactionStageConfig, Field(discriminator="type")
+]
 
 
 class AuditConfig(_Model):

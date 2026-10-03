@@ -77,6 +77,45 @@ rules and their semantics are in the [policy reference](policy-reference.md).
 The engine sits behind a small interface (`PolicyEngine`), so an OPA or Cedar
 adapter could replace it.
 
+## Redaction
+
+The redaction stage keeps secrets and personal data from crossing the
+gateway. On the way out it scans the string arguments of `tools/call` and
+`prompts/get`, by default for secrets only, so a model cannot paste a
+credential into a tool. (A recipient's email address is personal data, but
+sending email needs it.) On the way back it scans every string a model would
+read, by default for secrets and personal data.
+
+| Kind | Examples | Checked by |
+| --- | --- | --- |
+| secrets | private keys, AWS, GitHub, Slack, Stripe, Google and AI API keys, JWTs, bearer tokens, `user:password@` in URLs, `password=` / `api_key:` values | pattern; only the value after a label |
+| pii | emails, phone numbers, payment cards, IBANs, South African ID numbers, US SSNs | pattern plus Luhn, mod 97, date and issuance checks |
+
+`redact` replaces each value with `[REDACTED:<kind>]` and notes it under
+`_meta["io.github.mcp-customs/redaction"]`. `flag` only records it, in
+`_meta`, the audit row and the span. `block` refuses the call (`-32092` for
+prompts) or withholds the result, naming the kinds and fields, never the
+values. `allow` lists patterns for values that must pass, such as internal
+addresses.
+
+```yaml
+stages:
+  - type: policy          # first: decide on the real values
+    file: policies/finance-agent.yaml
+  - type: redaction       # then scrub them
+    mode: redact
+    requests: [secrets]
+    responses: [secrets, pii]
+    allow: ['.*@acme\.example']
+```
+
+**Rewritten arguments and `Mcp-Param-*` headers.** At 2026-07-28 a client
+copies some arguments into headers, and the server refuses a call whose
+headers and body disagree. The gateway learns which arguments each tool
+mirrors from the `tools/list` answers it relays. When a stage rewrites
+arguments, it recomputes those headers to match. If it has never seen the
+tool's schema, it refuses the call rather than send stale headers.
+
 ## Injection detection
 
 The injection stage scores every string a model would read in the answers
@@ -95,19 +134,54 @@ stages:
   - type: policy
     file: policies/finance-agent.yaml
   - type: injection
+    detector: layered   # hidden | classifier | layered
     mode: flag          # block | flag | strip
-    threshold: 0.997    # chosen on the benchmark's dev split for about 5% false positives
+    threshold: 0.5      # on calibrated scores: every detector's own decision point sits at 0.5
+    classifier_threshold: 0.997  # the classifier's raw cut-off; this one was chosen on dev for ~5% false positives
+    max_chars: 16000    # the classifier reads the first and last 8,000 characters of longer text
 ```
 
-The first detector is ProtectAI's `deberta-v3-base-prompt-injection-v2`
-(Apache-2.0, pinned revision), run on ONNX Runtime without PyTorch
-(`pip install mcp-customs[classifier]`). Scoring is CPU-bound and runs in
+Detectors score on different scales, so each is calibrated before they are
+combined: a detector's own decision point maps to 0.5, and `threshold` is set
+once, on that common scale. The hidden-text checks score 0.6 to 1.0 when they
+fire, so any finding of theirs acts at the default threshold.
+
+Two detectors, which `layered` runs in order:
+
+- `hidden`: cheap checks for text a human reviewer would not see. Unicode
+  tag characters, direction overrides, invisible characters inside words,
+  Latin words with Cyrillic or Greek look-alike letters, and base64 that
+  decodes to readable text. They run in microseconds on every result, and
+  report spans, so `strip` removes just that part. When one is certain, the
+  classifier is skipped.
+- `classifier`: ProtectAI's `deberta-v3-base-prompt-injection-v2`
+  (Apache-2.0, pinned revision), run on ONNX Runtime without PyTorch
+  (`pip install mcp-customs[classifier]`). Scoring is CPU-bound and runs in
 worker threads, off the event loop. Its measured trade-off is in
 `bench/results/`: at the model's default threshold it flags 36% of
 legitimate tool output, and at a threshold that flags about 4% it catches
 about half the attacks. Until a better detector layer exists, run it in
-`flag` mode, not `block`. Every decision goes into the audit log and the
-span (`customs.injection.*`), so its false positives can be reviewed.
+`flag` mode (the default), not `block`. Every decision goes into the audit
+log and the span (`customs.injection.*`), so its false positives can be
+reviewed.
+
+**The character budget.** The classifier reads 512-token windows, so its cost
+grows with the length of a result. `max_chars` bounds it: longer text is cut
+to its first and last halves, where injected instructions usually sit, and
+the hidden-text checks still read all of it. Measured on the benchmark's 109
+samples longer than 2,000 characters (Apple M4, 5 threads):
+
+| `max_chars` | Median | Slowest | Of the 109 flagged |
+| --- | --- | --- | --- |
+| 16,000 (default) | 3.4 s | 11.5 s | 74 |
+| 8,000 | 1.9 s | 4.5 s | 69 |
+| 4,000 | 0.9 s | 1.8 s | 65 |
+| 2,000 | 0.4 s | 0.7 s | 60 |
+
+All 109 are legitimate output: no attack in the benchmark is longer than
+2,000 characters, so what a smaller budget costs in detection is not
+measured. What it gives up is plain: an instruction placed in the middle of a
+long result, past the budget, is never read by the classifier.
 
 ## Audit
 

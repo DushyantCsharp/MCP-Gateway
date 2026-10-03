@@ -69,13 +69,17 @@ class Scored:
         return self.score >= threshold
 
 
-def make_detector(name: str, threads: int) -> Detector:
-    if name == "classifier":
-        from mcp_customs.detectors.classifier import OnnxClassifier
+def make_detector(name: str, threads: int, max_chars: int | None = None) -> Detector:
+    from mcp_customs.detectors.hidden import HiddenTextDetector, LayeredDetector
 
-        classifier = OnnxClassifier(threads=threads)
+    if name == "hidden":
+        return HiddenTextDetector()
+    if name in ("classifier", "layered"):
+        from mcp_customs.detectors.classifier import OnnxClassifier  # the optional extra
+
+        classifier = OnnxClassifier(threads=threads, max_chars=max_chars)
         classifier.load()
-        return classifier
+        return classifier if name == "classifier" else LayeredDetector([HiddenTextDetector(), classifier])
     raise SystemExit(f"unknown detector {name!r}")
 
 
@@ -146,11 +150,17 @@ def environment(detector: Detector) -> dict[str, Any]:
         "commit": commit.stdout.strip() + ("+dirty" if dirty.stdout.strip() else ""),
         "detector": detector.name,
         "detector_config": {
-            key: getattr(detector, key)
-            for key in ("model", "revision", "subfolder")
-            if hasattr(detector, key)
+            key: getattr(layer, key)
+            for layer in [detector, *getattr(detector, "layers", [])]
+            for key in ("model", "revision", "subfolder", "max_chars")
+            if hasattr(layer, key)
         },
-        "data": {"built": manifest["built"], "files": manifest["files"], "inputs": manifest["inputs"]},
+        "data": {
+            "version": manifest.get("version", 1),
+            "built": manifest["built"],
+            "files": manifest["files"],
+            "inputs": manifest["inputs"],
+        },
         "os": platform.platform(),
         "python": platform.python_version(),
         "versions": {pkg: version(pkg) for pkg in ("mcp-customs", "onnxruntime", "tokenizers")},
@@ -171,7 +181,8 @@ def markdown(env: dict[str, Any], threshold: float, attacks: list[Scored], benig
         f"# Detection results: {env['detector']}",
         "",
         f"Measured {env['date']} at commit `{env['commit']}`, detector `{env['detector']}` "
-        f"{env['detector_config']}, threshold {threshold}. Data built {env['data']['built']} "
+        f"{env['detector_config']}, threshold {threshold}. Benchmark v{env['data'].get('version', 1)}, "
+        f"built {env['data']['built']} "
         f"(`manifest.json` hashes {', '.join(f'{k} {v[:12]}' for k, v in env['data']['files'].items())}).",
         "",
         "Rates are the share of samples flagged, with Wilson 95% intervals. **Test is the headline**: no "
@@ -249,6 +260,8 @@ def main() -> None:
         type=Path,
         help="reuse the scores in an earlier results JSON instead of running the detector",
     )
+    parser.add_argument("--force", action="store_true", help="replace an existing results file")
+    parser.add_argument("--max-chars", type=int, help="the classifier reads at most this many characters")
     args = parser.parse_args()
 
     attacks = list(read_jsonl(DATASETS / "build" / "attack.jsonl"))
@@ -266,16 +279,18 @@ def main() -> None:
         env = {**earlier["environment"], "rescored_from": args.scores.name}
         detector_name = env["detector"]
     else:
-        detector = make_detector(args.detector, args.threads)
+        detector = make_detector(args.detector, args.threads, args.max_chars)
+        env = environment(detector)  # before scoring: the code state recorded is the code that runs
         print(
             f"scoring {len(attacks)} attack and {len(benign)} benign samples with {detector.name}", flush=True
         )
         scored_attacks, scored_benign = score(detector, attacks), score(detector, benign)
-        env = environment(detector)
         detector_name = detector.name
 
     args.out.mkdir(parents=True, exist_ok=True)
-    stem = f"detection-{env['date'][:10]}-{detector_name}"
+    stem = f"detection-v{env['data'].get('version', 1)}-{env['date'][:10]}-{detector_name}"
+    if (args.out / f"{stem}.md").exists() and not args.force:
+        raise SystemExit(f"{args.out / stem}.md exists; pass --force to replace a published result")
     (args.out / f"{stem}.md").write_text(markdown(env, args.threshold, scored_attacks, scored_benign))
     payload = {
         "environment": env,

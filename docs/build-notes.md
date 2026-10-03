@@ -413,6 +413,137 @@ the threshold chosen on dev for about 5% false positives, it catches 52.9%
     data's hashes exactly. Lesson: anything generated from the repository
     must be pinned like an external source.
 
+## Weekend 5: redaction and a second detector layer (2026-10-03)
+
+**Result:** redaction of secrets and personal data in both directions, a
+hidden-text detector layered with the classifier on one calibrated scale,
+and benchmark v2. The weekend's "done when" (detection and false positives
+both improve on Weekend 4, or say why not) was not met. On v2's test split
+the layered detector catches 80.9% of attacks [77.4, 84.0] and flags 36.0%
+of legitimate output [27.3, 45.8], the same as the classifier alone. Why not:
+finding 4.
+
+### The benchmark
+
+1. **One character separated the classes.** Testing whether the classifier
+   reacts to the JSON shape of tool output, rather than its words, meant
+   parsing each sample. Scoring each field on its own lowered paired false
+   positives only from 44.3% to 40.0% on dev. But 114 of 140 paired samples
+   parsed and none of the 782 attacks did. InjecAgent stores each attack
+   wrapped in an extra pair of double quotes, which the paired fills did not
+   have, so a detector could tell the classes apart by the first character.
+   Benchmark v2 removes the wrapping, and the build refuses to write if
+   attacks and their pairs are quoted differently. The classifier's test
+   detection moved from 82.0% to 80.9%: it had been getting a small free
+   advantage. Lesson: compare the classes on every surface feature, not only
+   on what the text says.
+
+2. **A rerun overwrote the published v1 results.** Result files were named
+   by UTC date and detector, so the v2 run wrote over the v1 file of the same
+   day. It was restored from git. Names now carry the benchmark version
+   (`detection-v2-…`), the harness refuses to overwrite without `--force`,
+   and it records the commit and environment before scoring, so the commit
+   recorded is the code that ran.
+
+3. **No attack is longer than 2,000 characters.** All 109 samples over that
+   length are legitimate output. Anything that depends on length, such as the
+   character budget (finding 6), can be measured for cost and false
+   positives, but not for detection.
+
+### The detection layer
+
+4. **A layer that keeps the stronger score cannot lower false positives.**
+   The hidden-text checks look for what a reader cannot see: Unicode tag
+   characters, direction overrides, invisible characters inside words,
+   look-alike letters, and base64 that decodes to text. On v2 they flag
+   nothing, attack or benign: the benchmark has no obfuscated attacks. So the
+   result measures only their cost (2 ms at p99) and their false positives
+   (none of 440). This is why the "done when" failed. Combining by maximum
+   can add detections, and can never remove a false positive. The false
+   positives are the classifier's, on long and repetitive output (81.5% of
+   it flagged) and on paired samples (40%). Lowering them needs a better
+   model, or a layer that can veto (judge a result benign), not one more
+   layer that can only flag.
+
+5. **One threshold for detectors on different scales.** The classifier's
+   scores sit near 1.0 for both classes (its 5% point is 0.9969), while a
+   hidden-text finding is 0.6 to 1.0 by rule. Each detector is now wrapped
+   in a piecewise-linear calibration that maps its own decision point to
+   0.5. The stage's `threshold` is set once on that scale, and the raw cut-off
+   is `classifier_threshold`. The stage now defaults to `flag`, since `block`
+   at the model's own threshold would withhold a third of legitimate results.
+
+6. **A budget bounds the cost; it does not make it small.** The classifier
+   now reads at most `max_chars` characters (default 16,000: the first and
+   last halves). The p99 moved only from 5.5 s to 4.9 s, because the
+   benchmark's long outputs are 11,000 to 29,000 characters, so 16,000 still
+   means about 10 windows. On those 109 samples the median is 3.4 s at
+   16,000, 1.9 s at 8,000, 0.9 s at 4,000 and 0.4 s at 2,000 characters, and
+   the samples flagged fall from 74 to 60. (The 16,000 figures come from the
+   full run; the others from re-scoring just those samples, same machine and
+   threads.) The default stays at 16,000, which reads most real results
+   whole. The cost of a small budget is plain even though it is not
+   measured: text in the middle of a long result is never read by the
+   classifier, and padding is a cheap way to put it there. The hidden-text
+   checks always read everything.
+
+7. **The attack the layer looks for happened to its own source.** Writing
+   the detector and its tests through the editing tools turned `\u` escapes
+   into the literal invisible and Cyrillic characters, twice, once through a
+   shell heredoc. The files looked unchanged, and a reviewer would not have
+   seen the difference. Every non-ASCII character in source is now written
+   as an escape. Ruff's `PLE` rules (control, direction and zero-width
+   characters) and `RUF001` (ambiguous letters) are enabled, so most literal
+   ones fail the lint.
+
+### Redaction
+
+8. **Redact after policy.** Policy decides on real values (an allowed
+   recipient, a known vendor account), so the redaction stage goes after
+   it. A scrubbed value would make any rule that constrains it fail.
+
+9. **Defaults follow what tools need.** Requests are scanned for secrets
+   only: a recipient's email address is personal data, but sending email
+   needs it. Results are scanned for secrets and personal data. `allow`
+   patterns let internal values through (the demo allows `@acme.example`).
+
+10. **Rewriting an argument breaks its header.** At 2026-07-28 a client
+    mirrors some arguments into `Mcp-Param-*` headers, and the server
+    refuses a call whose headers and body disagree. The gateway now learns
+    each tool's header mapping from the `tools/list` answers it relays, and
+    recomputes the headers after a rewrite. When it has not seen the schema,
+    it answers 500 rather than forward a mismatch. The schemas are held in
+    memory, so after a restart a redacted call fails closed until the client
+    lists tools again.
+
+11. **Text and structured content say the same thing twice.** The demo
+    invoice's billing contact is redacted four times: the email and the
+    phone, in the text block and again in `structuredContent`. A stage that
+    scrubbed only text would leak through the structured copy. Both are
+    scanned, and the contract test checks the agent never sees either.
+
+12. **A South African ID number is also a valid card number.** Its check
+    digit is Luhn, so the card pattern matched it. Stricter kinds are now
+    tried first. A Luhn-valid 13-digit number with an impossible date is
+    still reported, as a card.
+
+13. **Test secrets are built at runtime.** Fake keys in the tests are
+    assembled from parts, so the repository holds no string that a secret
+    scanner (or push protection) would flag.
+
+14. **A missing extra is a configuration error.** The default injection
+    detector needs the `[classifier]` extra. Without it the gateway stopped
+    with a raw `ModuleNotFoundError`. It now refuses to start with a message
+    naming the extra, or `detector: hidden`, which needs nothing. A model
+    that cannot be downloaded fails the same way.
+
+### Not done
+
+15. **More attack categories.** AgentDojo's documents and public obfuscated
+    and multi-step datasets still need converters, and their licences
+    checked. Meta's Prompt Guard 2 needs the Llama licence accepted on
+    Hugging Face. Both carry over (follow-ups).
+
 ## Follow-ups
 
 | Item | Why | When |
@@ -423,14 +554,17 @@ the threshold chosen on dev for about 5% false positives, it catches 52.9%
 | Anchor audit chain heads outside the database | Without that, cutting off the newest rows cannot be detected | Before v0.1 |
 | Least-privilege audit role (INSERT and SELECT only) and retention or partitioning | The demo connects as the table owner, which can drop the triggers | Before v0.1 |
 | OpenTelemetry metrics (decisions, latency histograms) | Traces exist; dashboards need metrics | After v0.1 |
-| A cheap detection layer beside the classifier (hidden characters, encodings, look-alike text, length budget) | The classifier misses about half the attacks at a usable false-positive rate, and long outputs cost seconds | Weekend 5 |
-| More attack categories: AgentDojo's retrieved documents, obfuscated and multi-step attacks | Benchmark v1 covers two categories in one format family | Weekend 5 |
-| Compare a second classifier (Meta Prompt Guard 2) on the same benchmark | One model is not a baseline | Weekend 5 |
-| Cap or stream detection on very long results | 4.8 s p99 per result | Before v0.1 |
-| Recompute `Mcp-Param-*` headers when a stage rewrites arguments | Redaction will change header-mirrored values; today the upstream rejects the mismatch, which fails closed | Weekend 5 |
+| ~~A cheap detection layer beside the classifier~~ | Done in Weekend 5; it cannot lower false positives (finding 4) | |
+| More attack categories: AgentDojo's retrieved documents, obfuscated, multi-step and long attacks | The benchmark covers two categories in one format family, none over 2,000 characters; the hidden-text layer and the character budget are unmeasured on detection | Next |
+| Compare a second classifier (Meta Prompt Guard 2) on the same benchmark | One model is not a baseline; needs the Llama licence accepted | Next |
+| Make detection on long results fast | The budget bounds it, but p99 is still 4.9 s; options: batch windows, a smaller default once long attacks are measured | Before v0.1 |
+| ~~Recompute `Mcp-Param-*` headers when a stage rewrites arguments~~ | Done in Weekend 5 | |
 | Treat results on resumed GET streams conservatively | They arrive without the request they answer | Weekend 4 |
 | Cancel the upstream call when the client disconnects before response headers | Wasted upstream work, and a modern-era cancellation not honoured | Before v0.1 |
 | RE2 or a timeout for policy regexes | Backtracking on attacker-chosen strings; the 8,192-character cap bounds it but does not remove it | Before v0.1 |
 | Budgets across calls | Split payments get under per-call limits | Weekend 6 |
 | OAuth protected-resource metadata (RFC 9728) and CORS preflight | OAuth-capable and browser clients need them to discover and reach the gateway | After v0.1 |
 | Nested argument paths in policies | Only top-level arguments can be constrained | After v0.1 |
+| A detector layer that can judge a result benign, not only flag it | Max-combined layers only add false positives; the classifier's are on long, repetitive and paired text | Before v0.1 |
+| Measure redaction on public PII and secret datasets | The patterns are covered by tests only | Before v0.1 |
+| Fetch a tool's schema when it is unknown, instead of refusing | After a restart, redacted calls with `Mcp-Param-*` headers fail closed until the client lists tools | Before v0.1 |

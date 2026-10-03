@@ -2,7 +2,15 @@ from pathlib import Path
 
 import pytest
 
-from mcp_customs.config import ConfigError, PolicyStageConfig, expand_env, load_config, parse_config
+from mcp_customs.config import (
+    ConfigError,
+    InjectionStageConfig,
+    PolicyStageConfig,
+    RedactionStageConfig,
+    expand_env,
+    load_config,
+    parse_config,
+)
 
 
 def test_minimal_config_gets_defaults() -> None:
@@ -96,3 +104,46 @@ def test_jwt_algorithms_default_by_key_source() -> None:
 def test_unknown_stage_types_are_rejected() -> None:
     with pytest.raises(ConfigError):
         parse_config({"stages": [{"type": "magic"}], "upstreams": {"w": {"url": "http://w/mcp"}}})
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        {"type": "redaction", "requests": ["passports"]},
+        {"type": "redaction", "allow": ["("]},
+        {"type": "redaction", "mode": "shred"},
+        {"type": "injection", "detector": "magic"},
+        {"type": "injection", "threshold": 1.5},
+        {"type": "injection", "max_chars": 10},
+    ],
+    ids=[
+        "unknown-kind",
+        "bad-allow-pattern",
+        "bad-redaction-mode",
+        "unknown-detector",
+        "threshold",
+        "tiny-budget",
+    ],
+)
+def test_invalid_stage_settings_are_rejected(stage: dict[str, object]) -> None:
+    with pytest.raises(ConfigError):
+        parse_config({"stages": [stage], "upstreams": {"w": {"url": "http://w/mcp"}}})
+
+
+def test_stage_defaults() -> None:
+    config = parse_config(
+        {
+            "stages": [{"type": "redaction"}, {"type": "injection"}],
+            "upstreams": {"w": {"url": "http://w/mcp"}},
+        }
+    )
+    redaction, injection = config.stages
+    assert isinstance(redaction, RedactionStageConfig)
+    assert (redaction.mode, redaction.requests, redaction.responses) == (
+        "redact",
+        ["secrets"],
+        ["secrets", "pii"],
+    )
+    assert isinstance(injection, InjectionStageConfig)
+    assert (injection.detector, injection.mode, injection.max_chars) == ("layered", "flag", 16_000)
+    assert (injection.threshold, injection.classifier_threshold) == (0.5, 0.5)

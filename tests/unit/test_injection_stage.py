@@ -7,14 +7,8 @@ from starlette.datastructures import Headers
 from mcp_customs.detectors import Detection
 from mcp_customs.jsonrpc import parse_message
 from mcp_customs.pipeline import CONTINUE, Exchange, Replace, ServerMessageContext
-from mcp_customs.pipeline.injection import (
-    INJECTION_BLOCKED,
-    META_KEY,
-    REMOVED,
-    WARNING,
-    InjectionStage,
-    text_fields,
-)
+from mcp_customs.pipeline.content import text_fields
+from mcp_customs.pipeline.injection import INJECTION_BLOCKED, META_KEY, REMOVED, WARNING, InjectionStage
 
 pytestmark = pytest.mark.anyio
 

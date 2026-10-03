@@ -6,6 +6,6 @@ and where. The gateway's injection stage and the benchmark harness both call
 :meth:`Detector.detect`, so any implementation plugs into both.
 """
 
-from mcp_customs.detectors.base import Detection, Detector
+from mcp_customs.detectors.base import Calibrated, Detection, Detector
 
-__all__ = ["Detection", "Detector"]
+__all__ = ["Calibrated", "Detection", "Detector"]

@@ -4,13 +4,14 @@ A security and governance gateway for MCP. It sits between an agent and its
 MCP servers and inspects every message in both directions: what goes out,
 what comes back, and what should not cross at all.
 
-> **Status: pre-release: identity, policy, audit, tracing and a first
-> injection detector.** With them configured, every request is authenticated,
-> every tool call is checked against a policy and recorded in a hash-chained
-> audit log before it runs, every exchange is traced, and tool results are
-> scored for prompt injection, in both MCP protocol eras. The detector is a
-> first layer with measured weaknesses (below). Redaction, approvals and
-> budgets land over the coming milestones (see the [roadmap](#roadmap)).
+> **Status: pre-release: identity, policy, audit, tracing, redaction and
+> two injection detector layers.** With them configured, every request is
+> authenticated, every tool call is checked against a policy and recorded in a
+> hash-chained audit log before it runs, every exchange is traced, secrets and
+> personal data are redacted in both directions, and tool results are checked
+> for prompt injection, in both MCP protocol eras. The detectors have measured
+> weaknesses (below). Approvals and budgets land over the coming milestones
+> (see the [roadmap](#roadmap)).
 >
 > Benchmark results (detection rate, false-positive rate, latency overhead,
 > and attack success rate with the gateway off vs on) will lead this README
@@ -31,7 +32,8 @@ open http://localhost:16686                                                   # 
 This starts two sample MCP servers (`workspace`: documents and email;
 `finance`: balances and transfers) with the gateway in front of them. The
 gateway requires tokens and enforces the
-[example finance policy](policies/examples/finance-agent.yaml). A stand-in
+[example finance policy](policies/examples/finance-agent.yaml), redacts
+personal data from results and flags hidden text in them. A stand-in
 identity provider mints the agent's token, and a scripted agent then
 summarises an invoice (allowed) and tries to pay it. The payment of 18,450 is
 over the policy's 10,000 single-approver limit, so the gateway blocks it and
@@ -76,6 +78,9 @@ auth:
 stages:
   - type: policy
     file: policies/finance-agent.yaml
+  - type: redaction            # after policy, which decides on the real values
+    allow: ['.*@acme\.example']
+  - type: injection            # hidden-text checks plus the classifier ([classifier] extra), flag only
 upstreams:
   workspace:
     url: http://workspace.internal:8001/mcp
@@ -141,24 +146,58 @@ run, against an independent restatement of the policy. See the
 - **Loud about gaps.** At start-up the gateway logs what it enforces, and
   warns if authentication, policy or audit is off.
 
-## Injection detection: first results
+## Redaction
 
-Measured on the held-out test split of [benchmark v1](bench/datasets/DATASHEET.md)
-(attacks from InjecAgent, hard benign tool output), with ProtectAI's
-open-source DeBERTa classifier. Full results, including every miss by id, are in
-[bench/results](bench/results/detection-2026-10-02-classifier.md).
+The `redaction` stage keeps secrets and personal data from crossing. On the
+way out it scans tool and prompt arguments for secrets (private keys, cloud
+and SaaS API keys, JWTs, bearer tokens, credentials in URLs, `password=`
+values), so a model cannot paste a credential into a tool. On the way back it
+scans everything a model would read for secrets and personal data (emails,
+phone numbers, payment cards, IBANs, South African ID numbers, US SSNs),
+using checksums where they exist. Each value becomes `[REDACTED:<kind>]`, or
+the stage only flags, or blocks. In the demo, the invoice's billing contact
+reaches the agent as `[REDACTED:email]` and `[REDACTED:phone]`, and the agent
+reports what was removed.
 
-| Threshold | Attacks caught | Legitimate output flagged |
+When a 2026-07-28 client mirrors an argument into an `Mcp-Param-*` header, a
+redacted argument would no longer match its header and the server would
+refuse the call. The gateway learns each tool's header mapping from
+`tools/list` and recomputes the headers, or refuses the call if it has not
+seen the schema. The patterns are covered by tests, not yet measured on real
+traffic. Details: [architecture](docs/architecture.md#redaction).
+
+## Injection detection: results
+
+Measured on the held-out test split of [benchmark v2](bench/datasets/DATASHEET.md)
+(attacks from InjecAgent, hard benign tool output). Two layers: cheap checks
+for hidden text (Unicode tag characters, direction overrides, invisible
+characters inside words, look-alike letters, base64 that decodes to text),
+and ProtectAI's open-source DeBERTa classifier. The default `layered`
+detector runs both. Full results, including every miss by id, are in
+[bench/results](bench/results/detection-v2-2026-10-02-layered.md).
+
+| Detector, threshold | Attacks caught | Legitimate output flagged |
 | --- | --- | --- |
-| model default (0.5) | 82.0% [78.5–85.0] | 36.0% [27.3–45.8] |
-| chosen on dev for ~5% false positives | 52.9% [48.7–57.1] | 4.0% [1.6–9.8] |
+| layered, model default (0.5) | 80.9% [77.4–84.0] | 36.0% [27.3–45.8] |
+| layered, chosen on dev for ~5% false positives | 52.8% [48.6–56.9] | 4.0% [1.6–9.8] |
+| hidden-text checks alone | 0.0% | 0.0% |
 
-95% Wilson intervals. The classifier was trained on prompts rather than tool
-output: it flags ordinary reviews, notes and logs (repetitive text especially),
-and its scores sit near 1.0 for both classes. It also costs 30 ms per result
-at the median and 4.8 s at p99 on long outputs. Run it in `flag` mode. Better
-layers, and attack categories it is not yet measured on (long retrieved
-documents, obfuscated and multi-step attacks), come next.
+95% Wilson intervals. The classifier does all the work here: the benchmark
+has no obfuscated attacks, so the hidden-text layer catches nothing, and the
+result shows only that it costs 2 ms at p99 and flags none of 440 hard benign
+samples. (v1 reported 82.0%. v2 removes a quoting artifact that let the
+classifier tell attacks from benign text by one character; see the
+[build notes](docs/build-notes.md).)
+
+The classifier was trained on prompts rather than tool output: it flags
+ordinary reviews, notes and logs (long and repetitive text especially), and
+its scores sit near 1.0 for both classes. It costs 37 ms per result at the
+median. On long results it reads at most 16,000 characters, the first and
+last halves, which still costs 4.9 s at p99. A smaller `max_chars` is
+faster, at a cost in coverage the benchmark cannot yet measure
+([trade-off](docs/architecture.md#injection-detection)). Run it in `flag`
+mode, the default. Attack categories it is not yet measured on (long
+retrieved documents, obfuscated and multi-step attacks) come next.
 
 ## Performance
 
@@ -220,10 +259,10 @@ response framing.
 | `src/mcp_customs/proxy/` | Streamable HTTP reverse proxy, SSE relay, header and routing rules |
 | `src/mcp_customs/auth/` | JWT verification, identities and scope grants, session binding |
 | `src/mcp_customs/policy/` | policy file model, rules engine, request targets |
-| `src/mcp_customs/pipeline/` | stage interface, pipeline, policy stage, version-aware replies |
+| `src/mcp_customs/pipeline/` | stage interface, pipeline, policy, redaction and injection stages, version-aware replies |
 | `src/mcp_customs/audit/` | hash chain, Postgres store, group-commit writer, verification |
 | `src/mcp_customs/telemetry/` | OpenTelemetry set-up and trace-context handling |
-| `src/mcp_customs/detectors/` | detector contract and the ONNX classifier |
+| `src/mcp_customs/detectors/` | detector contract, calibration and layering, hidden-text checks, the ONNX classifier, secret and PII patterns |
 | `src/mcp_customs/jsonrpc.py` | strict JSON-RPC parsing |
 | `policies/examples/` | finance, read-only and coding agent policies |
 | `demo/` | sample MCP servers, scripted agent, stand-in identity provider, Compose stack |
@@ -237,7 +276,8 @@ response framing.
 - [x] **Identity and policy:** JWT identity and task scopes, bound sessions, YAML policy with argument constraints
 - [x] **Audit and telemetry:** hash-chained audit log with `verify-audit`, OpenTelemetry spans, first latency numbers
 - [x] **Injection detection, layer one:** benchmark v1 (attack and hard benign sets, datasheet), injection stage with block/flag/strip, classifier detector, honest results with misses
-- [ ] **Second detector layer and data protection:** a cheap layer beside the classifier, PII and secret redaction, more attack categories (AgentDojo, obfuscated, multi-step)
+- [x] **Second detector layer and data protection:** hidden-text checks layered with the classifier on one calibrated scale, PII and secret redaction in both directions, benchmark v2
+- [ ] **More attack categories:** AgentDojo, obfuscated and multi-step attacks from public datasets
 - [ ] **Approvals and budgets:** held calls in Postgres, approve/deny page, per-agent rate and cost limits
 - [ ] **End-to-end agent eval:** attack success rate with the gateway off vs on, stdio wrapper
 - [ ] **v0.1:** threat model, policy reference, reproducible results

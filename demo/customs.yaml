@@ -11,8 +11,16 @@ auth:
     secret: ${CUSTOMS_JWT_SECRET}
 
 stages:
-  - type: policy
+  - type: policy            # decide on the real argument values first...
     file: policy.yaml
+  - type: redaction         # ...then keep secrets (out) and personal data (back) from crossing
+    mode: redact
+    requests: [secrets]
+    responses: [secrets, pii]
+    allow: ['.*@acme\.example']
+  - type: injection         # score what tools return before the agent reads it
+    detector: hidden        # the cheap checks only; "layered" adds the classifier (740 MB model)
+    mode: flag
 
 # Every call, its decision and its outcome, hash-chained in Postgres.
 # Verify with: docker compose -f demo/compose.yaml exec gateway customs verify-audit --key-env CUSTOMS_AUDIT_KEY

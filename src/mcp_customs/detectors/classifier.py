@@ -20,6 +20,14 @@ MAX_TOKENS: Final = 512
 STRIDE: Final = 128
 
 
+def budget(text: str, max_chars: int | None) -> str:
+    """At most ``max_chars`` characters: the start and the end, where injected text usually sits."""
+    if max_chars is None or len(text) <= max_chars:
+        return text
+    half = max_chars // 2
+    return f"{text[:half]}\n{text[-half:]}"
+
+
 @dataclass
 class OnnxClassifier:
     """Scores text with an ONNX sequence classifier whose labels include ``INJECTION``."""
@@ -29,6 +37,8 @@ class OnnxClassifier:
     subfolder: str = "onnx"
     name: str = "classifier"
     threads: int = 1
+    max_chars: int | None = None
+    """Read at most this many characters: the first and last halves of a longer text."""
 
     @cached_property
     def _runtime(self) -> tuple[Any, Any, int]:
@@ -69,7 +79,7 @@ class OnnxClassifier:
         import numpy as np
 
         tokenizer, session, injection = self._runtime
-        ids = tokenizer.encode(text).ids
+        ids = tokenizer.encode(budget(text, self.max_chars)).ids
         best = 0.0
         input_names = {node.name for node in session.get_inputs()}
         for window in self._windows(ids):

@@ -36,6 +36,8 @@ FILL_IN = HERE / "benign" / "fill-in.md"
 OUT = HERE / "build"
 SLOT = "<Attacker Instruction>"
 SEED = 20261002
+VERSION = 2
+"""v2 unwraps InjecAgent's tool responses (see ``unwrap``); v1 left them quoted."""
 
 ATTACK_FILES = {
     ("dh", "base"): "test_cases_dh_base.json",
@@ -53,12 +55,23 @@ def short_hash(text: str) -> str:
 # -- attacks ------------------------------------------------------------------------------------
 
 
+def unwrap(text: str) -> str:
+    """InjecAgent stores each tool response wrapped in an extra pair of double quotes.
+
+    The templates the benign ``paired`` class is built from are not wrapped,
+    so in v1 one leading character told an attack from its benign twin. The
+    quotes are a serialisation artifact, not part of the tool output, so v2
+    removes them.
+    """
+    return text[1:-1] if len(text) >= 2 and text[0] == text[-1] == '"' else text
+
+
 def injecagent_samples() -> Iterator[Sample]:
     for (kind, variant), name in ATTACK_FILES.items():
         for index, case in enumerate(json.loads((INJECAGENT / "data" / name).read_text())):
             yield Sample(
                 id=f"injecagent-{kind}-{variant}-{index:04d}",
-                text=case["Tool Response"],
+                text=unwrap(case["Tool Response"]),
                 label="attack",
                 category=CATEGORY[kind],
                 subcategory=case["Attack Type"],
@@ -310,6 +323,10 @@ def main() -> None:
         raise SystemExit(f"groups in both splits: {sorted(overlap)[:3]}")
     if any(SLOT in s.text for s in benign):
         raise SystemExit("a benign sample still contains the injection slot")
+    if any(s.text.startswith('"') for s in attacks) != any(
+        s.text.startswith('"') for s in benign if s.category == "paired"
+    ):
+        raise SystemExit("attack and paired benign samples differ in their outer quoting")
 
     write_jsonl(OUT / "attack.jsonl", attacks)
     write_jsonl(OUT / "benign.jsonl", benign)
@@ -320,6 +337,7 @@ def main() -> None:
         text=True,
     ).stdout.strip()
     manifest: dict[str, Any] = {
+        "version": VERSION,
         "built": date.today().isoformat(),
         "inputs": {
             "injecagent_commit": commit,

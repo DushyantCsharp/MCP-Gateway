@@ -83,6 +83,7 @@ src = ["src", "demo/src", "tests", "bench/harness", "bench/datasets"]
 select = [
     "E", "W", "F", "I", "N", "B", "UP", "SIM", "C4", "PIE", "RET", "PTH",
     "ASYNC", "S", "RUF", "PT", "TRY", "PERF", "FURB", "LOG", "G",
+    "PLE",  # includes bidirectional and zero-width characters in source ("Trojan Source")
 ]
 ignore = [
     "TRY003",  # long messages on raised exceptions are fine
