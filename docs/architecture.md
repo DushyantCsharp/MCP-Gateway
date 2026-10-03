@@ -317,6 +317,38 @@ All 109 are legitimate output: no attack in the benchmark is longer than
 measured. What it gives up is plain: an instruction placed in the middle of a
 long result, past the budget, is never read by the classifier.
 
+## Local servers (stdio)
+
+An upstream configured with `command` instead of `url` is a local MCP server
+the gateway launches. The proxy reaches it at a host only the gateway
+resolves (`<name>.stdio.internal`), through an HTTP transport mounted on its
+upstream client, so to every stage it is one more Streamable HTTP server.
+
+- **One process per session.** `initialize` starts a process and a session;
+  requests in the session go to its stdin, one JSON-RPC message per line, and
+  what it writes back is relayed as server-sent events. `DELETE` ends the
+  process, as does an idle session (30 minutes) or the gateway stopping.
+  `max_sessions` caps the processes per upstream.
+- **Handshake era.** A client in `auto` mode probes `server/discover` first;
+  the gateway answers "method not found" for a local upstream, and the client
+  falls back to `initialize`. A client pinned to the stateless revision cannot
+  use a local upstream yet.
+- **Routing.** An answer goes to the request it answers, a progress
+  notification to the request that set its token. Anything else (logs, list
+  changes, the server's own requests) goes to the most recent waiting request,
+  or to the session's GET stream when none is waiting.
+- **No inherited secrets.** The process sees `PATH`, `HOME`, the locale and
+  temporary-directory variables, and the upstream's `env`; nothing else from
+  the gateway's environment, which holds its token secret, audit key and
+  database credentials.
+- **Failure.** If the process exits, every request it was answering gets
+  `-32080` ("the local server has exited"), so no client waits on a dead
+  process.
+
+`customs stdio <url>` is the other direction: a client that can only launch
+local servers launches it instead, and it relays that client's stdin and
+stdout to the gateway over HTTP, with the token from `$CUSTOMS_TOKEN`.
+
 ## Audit
 
 Every exchange leaves events in an append-only, hash-chained Postgres table
@@ -442,6 +474,8 @@ check each one:
 | Resume token unknown, or another agent's | `404`, `-32600` |
 | Tool call over a budget limit | tool result with `isError: true` (`Blocked by gateway budget...`) |
 | Budget store unreachable | tool result with `isError: true`; the call is not made |
+| Local (stdio) server exited mid-request | JSON-RPC `-32080` on each request it was answering |
+| Too many local sessions (`max_sessions`) | `503`, `-32080` |
 
 Gateway error codes sit in the implementation-defined range and avoid the
 codes MCP already reserves (`-32000`, `-32001`, `-32020` to `-32022`, `-32042`).
@@ -502,4 +536,5 @@ return `Replace(...)` to rewrite it.
 - `Set-Cookie` from upstreams is dropped, so cookie-based sticky sessions do
   not work through the gateway.
 - Browser clients: there is no CORS preflight handling yet.
-- Streamable HTTP only; the stdio wrapper is planned for weekend 7.
+- Local (stdio) upstreams speak the handshake era only, one process per
+  session; a client pinned to the stateless revision cannot use them.
