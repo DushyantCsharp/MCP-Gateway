@@ -147,3 +147,31 @@ def test_stage_defaults() -> None:
     assert isinstance(injection, InjectionStageConfig)
     assert (injection.detector, injection.mode, injection.max_chars) == ("layered", "flag", 16_000)
     assert (injection.threshold, injection.classifier_threshold) == (0.5, 0.5)
+
+
+@pytest.mark.parametrize(
+    ("upstream", "message"),
+    [
+        ({}, "set exactly one of url and command"),
+        ({"url": "http://w/mcp", "command": ["server"]}, "set exactly one of url and command"),
+        ({"url": "http://w/mcp", "env": {"A": "1"}}, "env and cwd apply only to a command upstream"),
+        ({"command": ["server"], "headers": {"X": "1"}}, "headers apply only to a url upstream"),
+        ({"command": []}, "at least 1 item"),
+    ],
+)
+def test_upstreams_are_a_url_or_a_command(upstream: dict[str, object], message: str) -> None:
+    with pytest.raises(ConfigError, match=message):
+        parse_config({"upstreams": {"w": upstream}})
+
+
+def test_a_command_upstream_is_routed_to_its_local_transport() -> None:
+    config = parse_config(
+        {"upstreams": {"files": {"command": ["server", "--root", "/srv"], "env": {"A": "1"}}}}
+    )
+    upstream = config.upstreams["files"]
+    assert str(upstream.url) == "http://files.stdio.internal/mcp"
+    assert (upstream.command, upstream.env, upstream.is_local) == (
+        ["server", "--root", "/srv"],
+        {"A": "1"},
+        True,
+    )
