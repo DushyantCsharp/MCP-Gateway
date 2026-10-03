@@ -4,21 +4,31 @@ A security and governance gateway for MCP. It sits between an agent and its
 MCP servers and inspects every message in both directions: what goes out,
 what comes back, and what should not cross at all.
 
-> **Status: pre-release: identity, policy, approvals, budgets, audit,
-> tracing, redaction and two injection detector layers.** With them
-> configured, every request is authenticated; every tool call is checked
-> against a policy and per-agent budgets, and recorded in a hash-chained audit
-> log before it runs; consequential calls wait for a human, even across a
-> gateway restart; every exchange is traced; secrets and personal data are
-> redacted in both directions; and tool results are checked for prompt
-> injection, in both MCP protocol eras, for remote servers and local (stdio)
-> ones alike. The detectors have measured weaknesses (below).
->
-> What is measured: detection and false-positive rates, policy enforcement,
-> latency overhead and budget accuracy. What is not: attack success rate
-> against a live agent with the gateway off vs on. That evaluation was not
-> built (see the [build notes](docs/build-notes.md)), so no claim about it is
-> made here. Nothing is claimed before it is measured.
+Every tool call is authenticated, checked against a policy and per-agent
+budgets, and recorded in a hash-chained audit log before it runs.
+Consequential calls wait for a human, even across a gateway restart. Secrets
+and personal data are redacted in both directions, and tool results are
+checked for prompt injection. It works with both MCP protocol eras, remote
+servers and local (stdio) ones, and needs no change to the agent.
+
+## Results
+
+Each number is reproducible from a fresh clone with one command
+([below](#reproduce-the-numbers)).
+
+| What | Result | How it was measured |
+| --- | --- | --- |
+| Policy enforcement | **35 of 35** disallowed calls stopped (5 held for a human), **11 of 11** allowed calls delivered, in both protocol eras, plus 300 fuzzed transfers a run | A recorder at each real server: a call counts as stopped only if the server never received it |
+| Approvals | A held payment **survives a gateway restart** and is made **exactly once** after approval | Contract test and the Docker demo, in CI |
+| Budget accuracy | **0** calls and **0** amount past any agent's limit, through 1 or 2 gateways | 2,000 calls from 200 concurrent clients, counted at the server ([results](bench/results/budget-v1-2026-10-03.md)) |
+| Injection detection | **80.9%** of attacks flagged at **36.0%** false positives (model default); **52.8%** at **4.0%** (threshold chosen on dev) | Held-out test split of a benchmark built from InjecAgent, 95% Wilson intervals, every miss listed by id ([results](bench/results/detection-v2-2026-10-02-layered.md)) |
+| Latency overhead, p50 | **+3.2 ms** pass-through, **+4.2 ms** with policy, **+8.6 ms** with durable audit and tracing | 10 concurrent clients, Apple M4 ([results](bench/results/latency-2026-10-02.md)) |
+| Attack success against a live agent, gateway off vs on | **Not measured** | The evaluation was not built ([build notes](docs/build-notes.md), Weekend 7) |
+
+The detectors are a tripwire, not a wall: they miss attacks, and flag too much
+legitimate output to block on by default. Policy, approvals and budgets are
+what stop a steered agent. See the [threat model](docs/threat-model.md) for
+what the gateway does not protect against.
 
 ## Quick start
 
@@ -68,6 +78,21 @@ Jaeger, with a span per pipeline stage.
 
 If ports 8000 to 8002 or 16686 are taken, set `CUSTOMS_PORT`,
 `WORKSPACE_PORT`, `FINANCE_PORT` or `JAEGER_PORT`.
+
+## How it works
+
+```
+ agent ──► mcp-customs ─────────────────────────────────────────────► MCP server
+           identity · policy · budget · (approval) · redaction ──►     (HTTP, or a
+           audit row committed before the call                           local process)
+      ◄──  injection checks · redaction · listing filter ◄───────────  result
+```
+
+Every request is authenticated, then passes the configured stages in order.
+A stage can let it through, rewrite it, answer it, or hold it for a human; a
+held call waits in Postgres and is made once someone approves it. The result
+comes back through the same stages before the agent reads it. Every decision
+is in the audit log and in the trace. Details: [architecture](docs/architecture.md).
 
 ## Drop-in
 
@@ -334,6 +359,32 @@ With or without stages configured:
 See [docs/architecture.md](docs/architecture.md) for the request path, failure
 semantics, how to write a pipeline stage, and the known limitations.
 
+## Reproduce the numbers
+
+```bash
+git clone https://github.com/DushyantCsharp/MCP-Gateway.git && cd MCP-Gateway
+uv sync --group bench
+uv run --group bench python bench/reproduce.py
+```
+
+It needs [uv](https://docs.astral.sh/uv/), git and Docker running. It
+fetches InjecAgent at its pinned commit, rebuilds the detection benchmark and
+checks it is byte-identical to the published one, reruns detection (the first
+run downloads a 740 MB classifier), budget accuracy and a short latency run
+into `bench/results/reproduced/`, and compares each with the published
+results. The exit status is 0 when every comparison holds. Latency depends on
+the machine; the published numbers say which one they came from.
+
+## What it does not protect against
+
+In short: an agent steered by text it reads, when policy allows what the
+attacker wants; data leaving through channels policy allows; what a tool does
+internally; a fooled approver; secrets the redaction patterns do not know; the
+database owner rewriting the newest audit rows; a compromised gateway host;
+and traffic that does not pass through the gateway. The
+[threat model](docs/threat-model.md) explains each, and what a deployment
+must provide.
+
 ## Development
 
 Requires [uv](https://docs.astral.sh/uv/).
@@ -370,7 +421,7 @@ skipped.
 | `demo/` | sample MCP servers, scripted agent, stand-in identity provider, Compose stack |
 | `tests/contract/` | real-client tests through a running gateway: policy enforcement, approvals across a restart, budgets, audit, traces |
 | `bench/` | latency, detection and budget-accuracy harnesses, datasets and datasheet, committed results |
-| `docs/` | architecture, policy reference, build notes (what we found, milestone by milestone) |
+| `docs/` | architecture, threat model, policy reference, build notes (what we found, milestone by milestone) |
 
 ## Roadmap
 
@@ -383,7 +434,12 @@ skipped.
 - [x] **Approvals and budgets:** held calls in Postgres that survive a restart, approve/deny page and webhook, per-agent rate and cost limits in Redis, budget accuracy measured
 - [x] **Local servers:** stdio upstreams launched by the gateway (one process per session, no inherited secrets), and `customs stdio` for stdio-only clients
 - [ ] **End-to-end agent eval:** attack success rate with the gateway off vs on. Not built; see the Weekend 7 build notes
-- [ ] **v0.1:** threat model, policy reference, reproducible results
+- [x] **v0.1:** threat model, policy reference, results reproducible with one command
+
+## Contributing and security
+
+Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md). Please
+report vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## License
 

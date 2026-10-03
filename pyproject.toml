@@ -1,6 +1,6 @@
 [project]
 name = "mcp-customs"
-version = "0.0.1"
+version = "0.1.0"
 description = "A security and governance gateway for MCP: policy, injection detection, approvals, budgets and audit on every tool call."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -8,7 +8,7 @@ license = "Apache-2.0"
 authors = [{ name = "Dushyant Nana" }]
 keywords = ["mcp", "model-context-protocol", "agents", "security", "gateway", "proxy"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "Intended Audience :: System Administrators",
@@ -32,6 +32,12 @@ dependencies = [
     "typer>=0.27.2",
     "uvicorn[standard]>=0.54.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/DushyantCsharp/MCP-Gateway"
+Documentation = "https://github.com/DushyantCsharp/MCP-Gateway/tree/main/docs"
+Changelog = "https://github.com/DushyantCsharp/MCP-Gateway/blob/main/CHANGELOG.md"
+Issues = "https://github.com/DushyantCsharp/MCP-Gateway/issues"
 
 [project.optional-dependencies]
 classifier = [
