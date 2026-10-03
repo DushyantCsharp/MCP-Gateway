@@ -4,14 +4,20 @@ The rules engine combines rules the way Cedar does, so the order of rules
 never matters:
 
 1. A call is **denied** if any matching deny rule's constraints hold.
-2. Otherwise it is **allowed** if any matching allow rule's constraints hold.
-3. Otherwise it is **denied**: nothing is allowed by default.
+2. Otherwise it **needs approval** if any matching approve rule's constraints
+   hold: a human decides (see :mod:`mcp_customs.approvals`).
+3. Otherwise it is **allowed** if any matching allow rule's constraints hold.
+4. Otherwise it is **denied**: nothing is allowed by default.
+
+Approve comes before allow, so an approve rule cannot be bypassed by a broader
+allow rule: "every transfer over 10,000 needs a human" holds even where an
+allow rule covers all transfers.
 
 Constraints are evaluated in three-valued logic. An argument of the wrong type
 (a list where a string was expected), a missing argument, or a string too long
 to check is *unknown*, not false. Unknown never satisfies an allow rule and
-always triggers a deny rule, so what the gateway cannot check, it does not let
-through.
+always triggers a deny or approve rule, so what the gateway cannot check, it
+does not let through: it refuses it, or puts it in front of a human.
 
 When the token carries ``mcp:`` scope grants, a call outside them is denied
 before any rule is consulted: a task-scoped token can only narrow what the
@@ -62,14 +68,26 @@ class PolicyRequest:
     """The call's arguments as sent; ``None`` when absent."""
 
 
+class Effect(StrEnum):
+    ALLOW = "allow"
+    DENY = "deny"
+    APPROVE = "approve"
+    """Allowed only once a human approves it."""
+
+
 @dataclass(frozen=True, slots=True)
 class Decision:
-    allowed: bool
+    effect: Effect
     reason: str
     """Safe to show the caller: names the deciding rule, not how to get around it."""
     rule: str | None = None
     details: tuple[str, ...] = field(default=(), compare=False)
     """Per-argument findings, for logs and ``customs check-policy``; not sent to the caller."""
+
+    @property
+    def allowed(self) -> bool:
+        """Allowed outright, with no human in the loop."""
+        return self.effect is Effect.ALLOW
 
 
 class PolicyEngine(Protocol):
@@ -104,7 +122,7 @@ def _json_equal(left: Any, right: Any) -> bool:
     return type(left) is type(right) and bool(left == right)
 
 
-def _number(value: Any) -> Decimal | None:
+def parse_decimal(value: Any) -> Decimal | None:
     """A JSON number, or a plain decimal string such as ``"18450.00"``. No exponents, no ``NaN``."""
     if isinstance(value, bool):
         return None
@@ -152,7 +170,7 @@ def _check(constraint: Constraint, value: Any) -> tuple[Tri, list[str]]:
             record((matched is expected) if checkable else None, label)
 
     if constraint.min is not None or constraint.max is not None:
-        number = _number(value)
+        number = parse_decimal(value)
         if constraint.min is not None:
             record(None if number is None else number >= constraint.min, "min")
         if constraint.max is not None:
@@ -232,6 +250,12 @@ class RulePolicy:
         self.document = document
         self._allow = [rule for rule in document.rules if rule.effect == "allow"]
         self._deny = [rule for rule in document.rules if rule.effect == "deny"]
+        self._approve = [rule for rule in document.rules if rule.effect == "approve"]
+
+    @property
+    def needs_approvals(self) -> bool:
+        """Whether any rule can send a call to a human."""
+        return bool(self._approve)
 
     @classmethod
     def load(cls, path: Path) -> "RulePolicy":
@@ -240,14 +264,22 @@ class RulePolicy:
     def decide(self, request: PolicyRequest) -> Decision:
         identity, upstream, kind, name = request.identity, request.upstream, request.kind, request.name
         if identity is not None and not identity.permits(upstream, name):
-            return Decision(False, "outside the scope of the caller's token")
+            return Decision(Effect.DENY, "outside the scope of the caller's token")
 
         for rule in self._deny:
             if _applies(rule, identity, upstream, kind, name):
                 result, notes = _check_arguments(rule, request.arguments)
                 if result is not False:
                     why = "" if result else " (arguments could not be checked)"
-                    return Decision(False, f"denied by rule {rule.id!r}{why}", rule.id, tuple(notes))
+                    return Decision(Effect.DENY, f"denied by rule {rule.id!r}{why}", rule.id, tuple(notes))
+
+        for rule in self._approve:
+            if _applies(rule, identity, upstream, kind, name):
+                result, notes = _check_arguments(rule, request.arguments)
+                if result is not False:
+                    why = "" if result else " (arguments could not be checked)"
+                    reason = f"needs approval under rule {rule.id!r}{why}"
+                    return Decision(Effect.APPROVE, reason, rule.id, tuple(notes))
 
         near_misses: list[str] = []
         details: list[str] = []
@@ -255,13 +287,14 @@ class RulePolicy:
             if _applies(rule, identity, upstream, kind, name):
                 result, notes = _check_arguments(rule, request.arguments)
                 if result is True:
-                    return Decision(True, f"allowed by rule {rule.id!r}", rule.id)
+                    return Decision(Effect.ALLOW, f"allowed by rule {rule.id!r}", rule.id)
                 near_misses.append(rule.id)
                 details.extend(f"{rule.id}: {note}" for note in notes)
         if near_misses:
             rules = ", ".join(repr(rule) for rule in near_misses)
-            return Decision(False, f"arguments not permitted by rule {rules}", near_misses[0], tuple(details))
-        return Decision(False, f"no rule allows this {kind.value}")
+            reason = f"arguments not permitted by rule {rules}"
+            return Decision(Effect.DENY, reason, near_misses[0], tuple(details))
+        return Decision(Effect.DENY, f"no rule allows this {kind.value}")
 
     def visible(self, identity: Identity | None, upstream: str, kind: TargetKind, name: str) -> bool:
         if identity is not None and not identity.permits(upstream, name):
@@ -270,4 +303,5 @@ class RulePolicy:
             unconditional = not rule.arguments
             if unconditional and _applies(rule, identity, upstream, kind, name):
                 return False
-        return any(_applies(rule, identity, upstream, kind, name) for rule in self._allow)
+        permitting = (*self._allow, *self._approve)
+        return any(_applies(rule, identity, upstream, kind, name) for rule in permitting)

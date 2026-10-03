@@ -224,6 +224,11 @@ class Observation:
     def answered(self, answer: JSONObject) -> None:
         self._answer = answer
 
+    @property
+    def answer(self) -> JSONObject | None:
+        """The answer the client gets, as last reported."""
+        return self._answer
+
     async def rejected(self, status: int, reason: str) -> None:
         """A request refused before its message was read, or with no message at all."""
         self._closing = "none"

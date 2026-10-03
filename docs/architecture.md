@@ -20,8 +20,8 @@ client sends is what the server receives, unless a stage changes it.
 │ 5. read body    size limit → 413                                │
 │ 6. parse        exactly one strict JSON-RPC message → else 400  │
 │ 7. routing      Mcp-Method / Mcp-Name agree with body → else 400│
-│ 8. pipeline     client stages (policy, ...): continue / replace │
-│                 / respond                                       │
+│ 8. pipeline     client stages (policy, budget, ...): continue / │
+│                 replace / respond / hold (→ approvals)          │
 │ 9. audit        request row committed (durable) → else 503      │
 │10. forward      filtered headers, original bytes, traceparent   │
 └───────────────────────────────┬─────────────────────────────────┘
@@ -40,9 +40,10 @@ client sends is what the server receives, unless a stage changes it.
 
 Identity is checked at the HTTP layer, before anything else, so it covers
 every request including GET streams and DELETEs. The pipeline then runs the
-configured stages in order. The policy stage ships now. Request guards,
-approval and response guards follow, each as a new stage class plus one
-entry under `stages:` in the configuration.
+configured stages in order: policy, budget, redaction and injection ship
+today, each a stage class plus one entry under `stages:` in the
+configuration. A stage that holds a call hands it to the approvals service
+instead of step 9.
 
 ## Identity and sessions
 
@@ -70,12 +71,145 @@ outlive the process.
 The policy stage decides every request that names a tool, prompt, resource
 or unknown method, from the caller's identity, the upstream, the target and
 the arguments. Deny rules win, nothing is allowed by default, and an argument
-the gateway cannot check counts against the call. A denied `tools/call` comes
-back as a tool error the model can read; other denials are JSON-RPC errors.
+the gateway cannot check counts against the call. An approve rule sends a
+call to a human instead (below). A denied `tools/call` comes back as a tool
+error the model can read; other denials are JSON-RPC errors.
 Listings are filtered so a model is never offered what it may not call. The
 rules and their semantics are in the [policy reference](policy-reference.md).
 The engine sits behind a small interface (`PolicyEngine`), so an OPA or Cedar
 adapter could replace it.
+
+## Approvals
+
+A stage holds a call by returning `Hold`: the policy stage for an approve
+rule, the budget stage for a limit with `over: approve`. The gateway then
+
+1. records the call in Postgres (`customs_held_calls`): the request as sent,
+   the client's end-to-end headers (never its credentials), the agent, the
+   upstream and its session, and a SHA-256 digest of a fresh resume token;
+2. answers with an event stream whose first event carries the resume token as
+   its id, and a `retry` interval, followed by a `notifications/message`
+   saying the call is waiting;
+3. ends the stream after `stream_s` if nobody has decided. The client
+   reconnects with `GET` and `Last-Event-ID: <token>` after `retry_ms`
+   (SEP-1699 stream resumption, which the official SDK does unprompted) and
+   waits again.
+
+```
+agent                 gateway                          Postgres         human
+  │ tools/call ────────►│ policy: approve → Hold           │               │
+  │                     │ record the held call ───────────►│               │
+  │◄── id: <token> ─────│                                  │               │
+  │    (stream ends)    │                                  │◄── approve ───│ /approvals
+  │ GET Last-Event-ID ─►│ same agent, upstream, session?   │               │
+  │                     │ claim: approved → executing ────►│               │
+  │                     │ run the pipeline again; forward ──────────────► upstream
+  │                     │ store the answer ───────────────►│               │
+  │◄──── the answer ────│                                  │               │
+```
+
+The gateway that makes the call need not be the one that held it: everything
+it needs is in the row. So a held call survives a restart, or moves to another
+replica that shares the database (and `auth.session_secret`, which binds
+handshake-era sessions).
+
+- **Approved calls run at most once.** Making one starts with a conditional
+  update from `approved` to `executing`, which only one connection wins. The
+  call runs in a task the client cannot cut short, and its answer is stored
+  before it is delivered, so a client that reconnects gets the same answer,
+  not a second call. If the gateway stops mid-call, the row stays
+  `executing`; once longer than any upstream answer can take has passed, it
+  becomes `unknown` and the agent is told the outcome is unknown. It is never
+  retried.
+- **The approved call is checked again.** The pipeline runs once more on the
+  original request, with the approval attached. Holds are waived; denials are
+  not. A policy changed meanwhile to deny the call still denies it, and the
+  budget stage charges the call now, when it is made.
+- **A resume token works only for its agent.** A resume is refused with `404`
+  unless the caller is the same agent, on the same upstream and session.
+- **Approvers are people, not agents.** They sign in with a token carrying the
+  approver role, and nobody can approve a call made under their own identity.
+- Undecided calls expire, denied, after `ttl_s`. Finished rows, which keep
+  their arguments for the approver and the replay, are deleted after
+  `retention_days`. Each agent may have `max_pending_per_agent` calls waiting.
+
+Decisions come from the approvals page, `/approvals` (sign in by pasting an
+approver token; an HttpOnly, `SameSite=Strict` cookie, a CSRF token on every
+form, escaped output, and a Content Security Policy with no scripts, since the
+arguments on show were written by an agent), or from its JSON API, the resume
+webhook:
+
+```bash
+curl -H "Authorization: Bearer $APPROVER" https://gateway.example/approvals/api/calls
+curl -H "Authorization: Bearer $APPROVER" -H "Content-Type: application/json" \
+  -d '{"decision": "approve", "reason": "matches PO 4471"}' \
+  https://gateway.example/approvals/api/calls/<id>/decision
+customs approvals list    # the same API, from the CLI; also: approve <id>, deny <id> --reason ...
+```
+
+Every hold (a `request` event with decision `held`), decision (an `approval`
+event with the approver and reason) and approved call (a `request` event with
+`stages.approval.approved_by`) is in the audit log.
+
+```yaml
+approvals:
+  dsn: ${CUSTOMS_DATABASE_URL}   # may be the audit log's database
+  approver_role: approver
+  ttl_s: 3600                    # undecided calls expire, denied
+  retry_ms: 5000                 # the client's reconnect delay
+  stream_s: 25                   # how long one connection waits before it reconnects
+```
+
+A restart must finish within about twice `retry_ms`, since the SDK reconnects
+twice before giving up. `server.shutdown_grace_s` (5 seconds) bounds how long a
+stopping gateway waits for open streams, which would otherwise hold a restart
+up indefinitely.
+
+## Budgets
+
+Per-agent limits on tool calls, counted across calls in rolling windows. A
+per-call policy limit cannot stop an agent that splits one large payment into
+several small ones; a budget can.
+
+```yaml
+stages:
+  - type: policy
+    file: policies/finance-agent.yaml
+  - type: budget                    # after the policy stage
+    redis: ${CUSTOMS_REDIS_URL}     # omitted: counters in this process only
+    limits:
+      - id: ap-daily-payments
+        agents: [ap-agent]          # each agent has its own counter
+        tools: [transfer_funds]
+        sum: amount                 # add up this argument; or `cost: 0.02` per call; default: count calls
+        limit: 10000
+        per: 24h
+        over: approve               # beyond the limit a human decides; `deny` (the default) refuses
+      - id: calls-per-minute
+        limit: 60
+        per: 1m
+```
+
+A call is charged against every limit that applies to it, all at once or not
+at all. In Redis that is one Lua script, which drops entries that have left
+the window, checks each limit and charges them together, atomically for every
+gateway that shares the server. Measured with 200 concurrent clients, nothing
+slips past a limit through one gateway or two (`bench/results/budget-v1-*`).
+Counters kept in each process are right for a single gateway only: two
+replicas each admit an agent's full limit.
+
+- **What cannot be measured is refused.** A `sum` argument that is missing,
+  not a number, or negative stops the call (a negative amount would otherwise
+  lower the total).
+- **Over an `approve` limit, a human decides.** An approved call is charged
+  even though it goes over, so the total shows what was spent and the next
+  call needs a human too. A `deny` limit still refuses an approved call.
+- **Charged when admitted.** A call stays charged if a later stage refuses it
+  or the upstream fails: budgets err on the side of stopping.
+- **Exact amounts.** Amounts are integers in millionths, so sums of decimal
+  amounts never drift.
+- A refused call is told which limit, what it allows, what was used and,
+  for counted limits, when to try again.
 
 ## Redaction
 
@@ -301,6 +435,13 @@ check each one:
 | Upstream timeout | `504`, `-32081` |
 | Invalid upstream answer | `502`, `-32082` (JSON) or synthesised error event (SSE) |
 | Stage failure | `500`, `-32603` |
+| Call held for approval | `200`, an event stream; the answer arrives once a human decides |
+| Held call denied, or expired undecided | tool result with `isError: true` (`Denied at approval...`); `-32093` for other requests |
+| Call needs approval the gateway cannot arrange | tool result with `isError: true`; `-32094` for other requests |
+| Approved call lost mid-flight (gateway stopped) | tool result with `isError: true` saying the outcome is unknown; `-32095` for other requests |
+| Resume token unknown, or another agent's | `404`, `-32600` |
+| Tool call over a budget limit | tool result with `isError: true` (`Blocked by gateway budget...`) |
+| Budget store unreachable | tool result with `isError: true`; the call is not made |
 
 Gateway error codes sit in the implementation-defined range and avoid the
 codes MCP already reserves (`-32000`, `-32001`, `-32020` to `-32022`, `-32042`).
@@ -330,8 +471,17 @@ return `Replace(...)` to rewrite it.
 - Injection detection is a first layer, not protection: see the measured
   rates in `bench/results/`. It looks at one tool result at a time, so an
   attack spread across several results is not seen as one. Long results
-  cost seconds to score. Data redaction, approvals and budgets are not built
-  yet.
+  cost seconds to score.
+- Held calls keep their arguments in Postgres (the approver must see them, and
+  the gateway must replay them), unlike the audit log, which keeps a digest.
+  They are deleted `retention_days` after they finish.
+- A handshake-era call held for longer than the upstream keeps its session is
+  made in an expired session, and fails. Stateless (2026-07-28) calls do not
+  have this problem.
+- An approved call whose gateway stops mid-call ends with an unknown outcome:
+  at most once, never exactly once. Check the upstream before retrying.
+- A budget charge is not refunded when a later stage refuses the call or the
+  upstream fails.
 - Durable audit covers the `request` event. `result` events are written
   after the response, so a crash between the two leaves a request without
   its outcome.
@@ -346,8 +496,9 @@ return `Replace(...)` to rewrite it.
 - A response replayed on a resumed GET stream (`Last-Event-ID`) is checked
   without the request it answers.
 - A stage that rewrites `tools/call` arguments which the tool mirrors into
-  `Mcp-Param-*` headers would make the headers stale. The upstream then
-  rejects the call, so this fails closed.
+  `Mcp-Param-*` headers needs the tool's schema, learned from `tools/list`.
+  After a restart, until the client lists tools again, such a call is
+  refused (fails closed).
 - `Set-Cookie` from upstreams is dropped, so cookie-based sticky sessions do
   not work through the gateway.
 - Browser clients: there is no CORS preflight handling yet.

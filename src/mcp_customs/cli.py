@@ -21,14 +21,16 @@ from mcp_customs.audit.verify import verify_database
 from mcp_customs.auth import JwtAuthenticator
 from mcp_customs.auth.identity import Identity, parse_grants
 from mcp_customs.config import (
+    BudgetStageConfig,
     ConfigError,
     GatewayConfig,
     InjectionStageConfig,
     PolicyStageConfig,
+    RedactionStageConfig,
     load_config,
 )
 from mcp_customs.pipeline.factory import build_pipeline
-from mcp_customs.policy import PolicyError, PolicyRequest, RulePolicy, TargetKind
+from mcp_customs.policy import Effect, PolicyError, PolicyRequest, RulePolicy, TargetKind
 
 app = typer.Typer(
     name="customs",
@@ -39,6 +41,8 @@ app = typer.Typer(
 
 token_app = typer.Typer(help="Development tokens. Production tokens come from your identity provider.")
 app.add_typer(token_app, name="token")
+approvals_app = typer.Typer(help="Decide calls held for approval, through a running gateway's API.")
+app.add_typer(approvals_app, name="approvals")
 
 ConfigOption = Annotated[
     Path,
@@ -57,7 +61,7 @@ def _load(path: Path) -> GatewayConfig:
     """Load the configuration and every file it refers to, such as policies."""
     try:
         config = load_config(path)
-        build_pipeline(config.stages)
+        build_pipeline(config.stages, approvals=config.approvals is not None)
         if config.auth is not None:
             JwtAuthenticator(config.auth.jwt, httpx2.AsyncClient())  # reads and checks key files
     except (ConfigError, PolicyError) as exc:
@@ -87,6 +91,7 @@ def run(
         log_level=log_level.lower(),
         server_header=False,
         proxy_headers=False,
+        timeout_graceful_shutdown=settings.server.shutdown_grace_s,
     )
 
 
@@ -111,10 +116,19 @@ def check_config(config: ConfigOption = Path("customs.yaml")) -> None:
                 detail = str(stage.file)
             case InjectionStageConfig():
                 detail = f"{stage.detector}, {stage.mode}"
-            case _:
+            case RedactionStageConfig():
                 sides = f"requests {', '.join(stage.requests)}; responses {', '.join(stage.responses)}"
                 detail = f"{stage.mode}; {sides}"
+            case BudgetStageConfig():
+                where = "Redis" if stage.redis is not None else "in-process counters"
+                limits = ", ".join(f"{limit.id} {limit.limit}/{limit.per}" for limit in stage.limits)
+                detail = f"{where}; {limits}"
         typer.echo(f"  stage: {stage.type} ({detail})")
+    if settings.approvals is not None:
+        typer.echo(
+            f"  approvals: Postgres, approver role {settings.approvals.approver_role!r}, "
+            f"expire after {settings.approvals.ttl_s:g}s"
+        )
     if settings.audit is None:
         typer.echo("  audit: none (calls are not recorded)")
     else:
@@ -176,7 +190,8 @@ def check_policy(
 ) -> None:
     """Validate a policy; with a call described, decide it.
 
-    Exit status: 0 when the call is allowed (or the policy is valid), 1 when denied, 2 on errors.
+    Exit status: 0 when the call is allowed (or the policy is valid), 1 when denied, 2 on errors,
+    3 when it needs a human's approval.
     """
     try:
         engine = RulePolicy.load(policy)
@@ -195,7 +210,7 @@ def check_policy(
     if not targets:
         typer.echo(f"ok: {policy} ({len(engine.document.rules)} rules)")
         for rule in engine.document.rules:
-            typer.echo(f"  {rule.effect:5} {rule.id}")
+            typer.echo(f"  {rule.effect:7} {rule.id}")
         return
     if len(targets) > 1 or upstream is None:
         raise _fail("describe one call: --upstream and exactly one of --tool, --prompt, --resource, --method")
@@ -207,11 +222,16 @@ def check_policy(
     identity = Identity(agent, frozenset(role or ()), grants=grants) if agent is not None else None
     ((kind, name),) = targets
     decision = engine.decide(PolicyRequest(identity, upstream, kind, name, args))
-    typer.echo(f"{'ALLOW' if decision.allowed else 'DENY'}: {decision.reason}")
+    typer.echo(f"{decision.effect.value.upper()}: {decision.reason}")
     for detail in decision.details:
         typer.echo(f"  {detail}")
-    if not decision.allowed:
-        raise typer.Exit(code=1)
+    match decision.effect:
+        case Effect.DENY:
+            raise typer.Exit(code=1)
+        case Effect.APPROVE:
+            raise typer.Exit(code=3)
+        case Effect.ALLOW:
+            pass
 
 
 @token_app.command("issue")
@@ -250,6 +270,98 @@ def issue_token(
     else:
         out.write_text(token)
         out.chmod(0o644)
+
+
+GatewayUrl = Annotated[str, typer.Option("--url", envvar="CUSTOMS_URL", help="The gateway's base URL.")]
+ApproverTokenFile = Annotated[
+    Path | None,
+    typer.Option(
+        envvar="CUSTOMS_APPROVER_TOKEN_FILE",
+        help="File holding an approver token; else $CUSTOMS_APPROVER_TOKEN.",
+        dir_okay=False,
+    ),
+]
+
+
+def _approvals_request(
+    method: str, url: str, path: str, token_file: Path | None, body: dict[str, Any] | None = None
+) -> Any:
+    token = (
+        token_file.read_text().strip() if token_file is not None else os.environ.get("CUSTOMS_APPROVER_TOKEN")
+    )
+    if not token:
+        raise _fail("give an approver token with --token-file or $CUSTOMS_APPROVER_TOKEN")
+    try:
+        response = httpx2.request(
+            method,
+            f"{url.rstrip('/')}/approvals/api{path}",
+            headers={"authorization": f"Bearer {token}"},
+            json=body,
+            timeout=30,
+        )
+    except httpx2.TransportError as exc:
+        raise _fail(f"cannot reach {url}: {exc}") from exc
+    if response.status_code >= 400:
+        try:
+            message = response.json().get("error", response.text)
+        except ValueError:
+            message = response.text
+        raise _fail(f"{response.status_code}: {message}")
+    return response.json()
+
+
+def _show(call: dict[str, Any]) -> str:
+    what = f"{call['target'] or call['method']} on {call['upstream']}"
+    by = f", {call['status']} by {call['decided_by']}" if call.get("decided_by") else ""
+    return f"{call['id']}  {call['status']:9} {what} for {call['agent']} ({call['reason']}){by}"
+
+
+@approvals_app.command("list")
+def approvals_list(
+    url: GatewayUrl = "http://127.0.0.1:8000",
+    token_file: ApproverTokenFile = None,
+    status: Annotated[str, typer.Option(help="pending, all, or a comma-separated list.")] = "pending",
+    as_json: Annotated[bool, typer.Option("--json", help="Print the calls as JSON.")] = False,
+) -> None:
+    """List held calls, oldest decisions last."""
+    calls = _approvals_request("GET", url, f"/calls?status={status}", token_file)
+    if as_json:
+        typer.echo(json.dumps(calls, indent=2))
+        return
+    for call in calls:
+        typer.echo(_show(call))
+        typer.echo(f"    arguments: {json.dumps(call['arguments'], sort_keys=True)}")
+
+
+def _decide_command(
+    decision: str, held_id: str, url: str, token_file: Path | None, reason: str | None
+) -> None:
+    call = _approvals_request(
+        "POST", url, f"/calls/{held_id}/decision", token_file, {"decision": decision, "reason": reason}
+    )
+    typer.echo(_show(call))
+
+
+@approvals_app.command("approve")
+def approvals_approve(
+    held_id: Annotated[str, typer.Argument(help="The held call's id.")],
+    url: GatewayUrl = "http://127.0.0.1:8000",
+    token_file: ApproverTokenFile = None,
+    reason: Annotated[str | None, typer.Option(help="Recorded, and shown to nobody but approvers.")] = None,
+) -> None:
+    """Approve a held call: it goes ahead when its agent next connects."""
+    _decide_command("approve", held_id, url, token_file, reason)
+
+
+@approvals_app.command("deny")
+def approvals_deny(
+    held_id: Annotated[str, typer.Argument(help="The held call's id.")],
+    url: GatewayUrl = "http://127.0.0.1:8000",
+    token_file: ApproverTokenFile = None,
+    reason: Annotated[str | None, typer.Option(help="Shown to the agent.")] = None,
+) -> None:
+    """Deny a held call: the agent is told, with the reason."""
+    _decide_command("deny", held_id, url, token_file, reason)
 
 
 @app.command()

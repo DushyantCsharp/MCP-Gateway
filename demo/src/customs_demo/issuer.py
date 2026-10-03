@@ -18,6 +18,7 @@ DEMO_AGENTS: dict[str, dict[str, Any]] = {
     "ap-agent": {"sub": "ap-agent", "task": "ap-demo"},
     "auditor": {"sub": "audit-bot", "roles": ["auditor"]},
     "intruder": {"sub": "intruder"},
+    "approver": {"sub": "demo-approver", "roles": ["approver"]},  # a human, deciding held calls
 }
 
 

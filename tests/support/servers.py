@@ -15,14 +15,21 @@ import uvicorn
 from starlette.types import ASGIApp
 
 
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 @contextmanager
-def serve_in_thread(app: ASGIApp, *, startup_timeout_s: float = 10.0) -> Iterator[str]:
-    """Serve ``app`` on 127.0.0.1 and yield its base URL."""
+def serve_in_thread(app: ASGIApp, *, port: int = 0, startup_timeout_s: float = 10.0) -> Iterator[str]:
+    """Serve ``app`` on 127.0.0.1 and yield its base URL. ``port`` 0 picks a free one."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", 0))
+    sock.bind(("127.0.0.1", port))
     port = sock.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(app, log_level="warning", lifespan="on", ws="none"))
+    config = uvicorn.Config(app, log_level="warning", lifespan="on", ws="none", timeout_graceful_shutdown=1)
+    server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
     thread.start()
     deadline = time.monotonic() + startup_timeout_s

@@ -2,7 +2,9 @@
 
 from collections.abc import Sequence
 
+from mcp_customs.budgets import BudgetStage, MemoryBudgetStore, RedisBudgetStore
 from mcp_customs.config import (
+    BudgetStageConfig,
     ConfigError,
     InjectionStageConfig,
     PolicyStageConfig,
@@ -47,6 +49,12 @@ def build_stage(config: StageConfig) -> Stage:
             return InjectionStage(
                 detector, mode=config.mode, threshold=config.threshold, threads=config.threads
             )
+        case BudgetStageConfig():
+            if config.redis is not None:
+                return BudgetStage(
+                    config.limits, RedisBudgetStore(config.redis.get_secret_value()), backend="redis"
+                )
+            return BudgetStage(config.limits, MemoryBudgetStore(), backend="memory")
         case RedactionStageConfig():
             scanner = SensitiveScanner(sorted({*config.requests, *config.responses}), allow=config.allow)
             return RedactionStage(
@@ -54,6 +62,17 @@ def build_stage(config: StageConfig) -> Stage:
             )
 
 
-def build_pipeline(configs: Sequence[StageConfig]) -> Pipeline:
-    """Load every stage now, so a broken policy file stops the gateway at start-up."""
-    return Pipeline([build_stage(config) for config in configs])
+def build_pipeline(configs: Sequence[StageConfig], *, approvals: bool = False) -> Pipeline:
+    """Load every stage now, so a broken policy file stops the gateway at start-up.
+
+    ``approvals`` says whether the gateway can hold calls for a human; a stage
+    that would hold calls without it is a configuration error, not a surprise
+    denial at run time.
+    """
+    pipeline = Pipeline([build_stage(config) for config in configs])
+    if not approvals and (holding := [stage.name for stage in pipeline.stages if stage.needs_approvals]):
+        raise ConfigError(
+            f"the {', '.join(holding)} stage can send calls for approval, "
+            "but no approvals section is configured"
+        )
+    return pipeline

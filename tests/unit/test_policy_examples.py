@@ -12,14 +12,14 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from mcp_customs.auth import Identity, parse_grants
-from mcp_customs.policy import PolicyRequest, RulePolicy, TargetKind
+from mcp_customs.policy import Effect, PolicyRequest, RulePolicy, TargetKind
 from tests.support.finance_cases import (
     AP,
     AUDITOR,
     FINANCE_CASES,
     INTRUDER,
     Case,
-    author_intends_to_allow,
+    author_intends,
     email,
     json_values,
     transfer,
@@ -37,7 +37,7 @@ T = TargetKind.TOOL
 @pytest.mark.parametrize("case", FINANCE_CASES, ids=[case.label for case in FINANCE_CASES])
 def test_finance_agent(case: Case) -> None:
     request = PolicyRequest(case.identity, case.upstream, case.kind, case.name, case.arguments)
-    assert FINANCE.decide(request).allowed is case.allowed
+    assert FINANCE.decide(request).effect is case.expected
 
 
 def test_task_scoped_token_narrows_the_finance_agent() -> None:
@@ -96,18 +96,19 @@ def test_coding_agent(name: str, arguments: Any, allowed: bool) -> None:
     assert CODING.decide(PolicyRequest(CODER, "repo", T, name, arguments)).allowed is allowed
 
 
-# -- property: no generated transfer gets through unless the policy's author would allow it -------
+# -- property: no generated transfer is decided other than as the policy's author intends ---------
 
 
 @settings(max_examples=2000, deadline=None)
 @given(transfer_arguments)
 def test_generated_transfers_match_the_authors_intent(arguments: dict[str, Any]) -> None:
     decision = FINANCE.decide(PolicyRequest(AP, "finance", T, "transfer_funds", arguments))
-    assert decision.allowed is author_intends_to_allow(arguments)
+    assert decision.effect is author_intends(arguments)
 
 
 @settings(max_examples=500, deadline=None)
 @given(st.one_of(st.dictionaries(st.text(max_size=8), json_values, max_size=4), json_values))
 def test_no_one_but_the_ap_agent_can_ever_pay(arguments: Any) -> None:
     for identity in (AUDITOR, INTRUDER, None, Identity("ap-agent-2")):
-        assert not FINANCE.decide(PolicyRequest(identity, "finance", T, "transfer_funds", arguments)).allowed
+        decision = FINANCE.decide(PolicyRequest(identity, "finance", T, "transfer_funds", arguments))
+        assert decision.effect is Effect.DENY  # not even with a human's approval

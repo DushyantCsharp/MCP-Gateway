@@ -2,10 +2,12 @@
 
 from mcp_customs.pipeline.base import (
     CONTINUE,
+    Approval,
     ClientMessageContext,
     ClientOutcome,
     Continue,
     Exchange,
+    Hold,
     Pipeline,
     Replace,
     Respond,
@@ -17,10 +19,12 @@ from mcp_customs.pipeline.replies import error_reply, result_reply, tool_error_r
 
 __all__ = [
     "CONTINUE",
+    "Approval",
     "ClientMessageContext",
     "ClientOutcome",
     "Continue",
     "Exchange",
+    "Hold",
     "Pipeline",
     "Replace",
     "Respond",

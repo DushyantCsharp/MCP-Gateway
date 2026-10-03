@@ -544,6 +544,127 @@ finding 4.
     checked. Meta's Prompt Guard 2 needs the Llama licence accepted on
     Hugging Face. Both carry over (follow-ups).
 
+## Weekend 6: approvals and budgets (2026-10-03)
+
+**Result:** the "done when" is met. A consequential call waits for a human
+and survives a gateway restart, in both protocol eras. The test stops the
+gateway while a payment waits, starts a new one on the same port, approves the
+payment there, and checks that the agent's original `call_tool` returns the
+receipt and that the finance server recorded exactly one payment
+(`tests/contract/test_approvals_restart.py`). CI does the same in the Docker
+demo with `docker compose restart gateway`. Budgets hold under load: with
+counters in Redis, no call and no amount got past any agent's limit, through
+one gateway or two (`bench/results/budget-v1-2026-10-03.md`).
+
+### Approvals
+
+1. **The protocol already had a way to wait.** Since 2025-11-25 (SEP-1699) a
+   server may end an event stream after an event that has an id, and the
+   client reconnects with `Last-Event-ID` after the `retry` interval. The
+   Python SDK does this on its own, in both eras. So a held call needs no
+   client changes: the gateway opens the stream with a resume token as the
+   event id, ends it every `stream_s`, and picks the call up from Postgres
+   whenever the client comes back, from whichever gateway it reaches. MCP's
+   tasks (SEP-1686, an extension in 2026-07-28) fit too, but only for clients
+   that opt in, and most do not.
+
+2. **The SDK reconnects twice.** Each attempt waits `retry` milliseconds, and
+   after two failures the call fails. A restart therefore has about twice
+   `retry_ms` (10 seconds by default) to come back.
+
+3. **A restart waited on streams that never end.** Uvicorn's graceful
+   shutdown waits for every open connection, with no limit by default. A
+   handshake-era client keeps a server-initiated GET stream open, so the old
+   gateway was still waiting on it when the client's two reconnects failed
+   (the logs show no reconnect reaching any gateway). The stateless era passed and the handshake era
+   failed, which pointed at the GET stream. The gateway now passes
+   `server.shutdown_grace_s` (5 seconds) to uvicorn. The same wait would have
+   stalled every production restart.
+
+4. **Without a fixed key, a restart forgets sessions.** Handshake-era session
+   ids are HMAC-bound to their agent with `auth.session_secret`. When none is
+   set, the key is random per process, so after a restart the client's resume
+   gets a `404` for an unknown session. This was documented for replicas;
+   approvals make it matter for restarts too. Start-up now warns when
+   approvals are on without the key, and the demo sets one.
+
+5. **Postgres caught what the memory store did not.** `CASE WHEN %s IS NULL`
+   with an untyped parameter fails in Postgres ("could not determine data
+   type"). Every unit test passed against the memory store; the first run
+   against Postgres failed. Lesson: test a state machine against the store it
+   will run on.
+
+6. **At most once, not exactly once.** Making an approved call starts with a
+   conditional `approved` to `executing` update, and the answer is stored
+   before it is delivered. If the gateway stops in between, nobody can know
+   whether the payment went through, so the call becomes `unknown` and the
+   agent is told to check. Retrying a payment would be worse than asking a
+   person to look.
+
+7. **The approved call runs the pipeline again.** Rather than storing where
+   the pipeline stopped, the gateway runs every stage again on the original
+   request, with the approval attached. Holds are waived and denials are not,
+   so a policy tightened in the meantime still wins. It costs one rule: the
+   budget stage must come after the policy stage, or a call charged before
+   policy held it would be charged again when approved.
+
+8. **Approve beats allow, and the unknown goes to a human.** An approve rule
+   must not be bypassable by a broad allow rule, so it comes second, after
+   deny. Like deny, it fires on what cannot be checked. In the decision table
+   the two over-limit payments became approvals, and so did two payments
+   whose amount cannot be read (`"1e3"`, `true`): the restated intent now
+   says so in three values, and agrees with the engine on 2,000 generated
+   transfers.
+
+9. **The approvals page is an injection target too.** The arguments an
+   approver reads were written by an agent, possibly one steered by a prompt
+   injection aimed at the approver. The page escapes everything, allows no
+   scripts (CSP), and carries a CSRF token on every form. An approver cannot
+   approve a call made under their own identity, and the resume token is
+   stored only as a digest.
+
+10. **Two tests hung instead of failing.** Making large payments approvable
+    turned tests that expected a denial into tests waiting forever for a
+    human, and a test helper choked on the empty data of the stream's first
+    event. pytest's faulthandler found both. A hold is a new kind of outcome,
+    and every caller has to handle it, test helpers included.
+
+### Budgets
+
+11. **The benchmark found a production bug on its first run.** Under 200
+    concurrent calls, redis-py's default async pool raised "Too many
+    connections" instead of waiting. The stage failed closed, so nothing
+    slipped through, but calls were refused for the wrong reason. The store
+    now uses a blocking pool, with a test that drives 100 concurrent charges
+    through 2 connections. The first results file was discarded, and the
+    numbers were measured again at a clean commit.
+
+12. **Replicas must share their counters.** Measured, not argued: with
+    counters in each process, two gateways let 400 calls and 79,657.59 in
+    payments past per-agent limits, since each admits an agent's full limit.
+    With Redis, nothing gets past. A single Lua script drops expired entries,
+    checks every limit that applies and charges them all or none.
+
+13. **A negative amount would lower the total.** A sum limit refuses a call
+    whose amount is missing, not a number or negative. Amounts are integers
+    in millionths, so decimal sums never drift.
+
+14. **Budgets stop early rather than late.** A call is charged when admitted,
+    with no refund if a later stage or the upstream fails. Under contention a
+    payment that would not fit is refused even if a smaller one later would
+    have. The spend scenario stopped agents at most 21.54 short of 10,000.
+
+15. **The same deprecated import, twice.** `testcontainers.redis` warns
+    that it is deprecated, which CI's warnings-as-errors would turn into a
+    failure, just as `testcontainers.postgres` did in Weekend 3. The current
+    path is `testcontainers.community.redis`.
+
+16. **The demo's order matters.** An approved 18,450 payment is charged
+    against the daily budget, so the next payment needs a human as well. Run
+    after it, the split payment's first half was held too. That is the
+    design working, but it confused the story, so the README and CI run the
+    split payment first.
+
 ## Follow-ups
 
 | Item | Why | When |
@@ -562,9 +683,14 @@ finding 4.
 | Treat results on resumed GET streams conservatively | They arrive without the request they answer | Weekend 4 |
 | Cancel the upstream call when the client disconnects before response headers | Wasted upstream work, and a modern-era cancellation not honoured | Before v0.1 |
 | RE2 or a timeout for policy regexes | Backtracking on attacker-chosen strings; the 8,192-character cap bounds it but does not remove it | Before v0.1 |
-| Budgets across calls | Split payments get under per-call limits | Weekend 6 |
+| ~~Budgets across calls~~ | Done in Weekend 6 | |
 | OAuth protected-resource metadata (RFC 9728) and CORS preflight | OAuth-capable and browser clients need them to discover and reach the gateway | After v0.1 |
 | Nested argument paths in policies | Only top-level arguments can be constrained | After v0.1 |
 | A detector layer that can judge a result benign, not only flag it | Max-combined layers only add false positives; the classifier's are on long, repetitive and paired text | Before v0.1 |
 | Measure redaction on public PII and secret datasets | The patterns are covered by tests only | Before v0.1 |
 | Fetch a tool's schema when it is unknown, instead of refusing | After a restart, redacted calls with `Mcp-Param-*` headers fail closed until the client lists tools | Before v0.1 |
+| Notify approvers when a call is held (an outbound webhook to chat or email) | Today an approver has to look at the page or the API | Before v0.1 |
+| Sign approvers in through the identity provider (OIDC), not by pasting a token | Pasting a JWT works but is not how people log in | After v0.1 |
+| Wake waiting connections across replicas at once (Postgres LISTEN/NOTIFY) | A decision made on another replica is seen within `poll_s` (1 second) | After v0.1 |
+| Support MCP tasks for clients that opt in | Stream resumption covers every client today; tasks would let a client show progress | After v0.1 |
+| Refund a budget charge when the upstream fails | Charges are conservative: a failed call still counts | After v0.1 |

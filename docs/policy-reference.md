@@ -1,7 +1,7 @@
 # Policy reference
 
 A policy decides, for every request that names a tool, prompt or resource,
-whether the caller may make it. Policies are YAML files loaded by the policy
+whether the caller may make it, may not, or may once a human approves. Policies are YAML files loaded by the policy
 stage:
 
 ```yaml
@@ -18,20 +18,24 @@ customs check-policy policies/examples/finance-agent.yaml
 customs check-policy policies/examples/finance-agent.yaml \
   --agent ap-agent --upstream finance --tool transfer_funds \
   --arguments '{"from_account": "ACC-OPERATING", "to_account": "ACC-NORTHWIND", "amount": "18450.00", "memo": "INV-2026-091"}'
-# DENY: arguments not permitted by rule 'ap-pay-known-vendors'
-#   ap-pay-known-vendors: argument 'amount': max failed
+# APPROVE: needs approval under rule 'ap-large-payments-need-approval'
 ```
 
-The exit status is 0 when the call is allowed, 1 when it is denied and 2 on an
-error, so policy expectations can run in CI.
+The exit status is 0 when the call is allowed, 1 when it is denied, 3 when it
+needs approval and 2 on an error, so policy expectations can run in CI.
 
 ## How rules combine
 
 1. A call is **denied** if any deny rule that matches it holds.
-2. Otherwise it is **allowed** if any allow rule that matches it holds.
-3. Otherwise it is **denied**. Nothing is allowed by default.
+2. Otherwise it **needs approval** if any approve rule that matches it holds:
+   the gateway holds it until a human decides (see the
+   [architecture](architecture.md#approvals)).
+3. Otherwise it is **allowed** if any allow rule that matches it holds.
+4. Otherwise it is **denied**. Nothing is allowed by default.
 
-Rule order never matters. To allow everything, write an allow rule for `"*"`.
+Approve comes before allow on purpose: an approve rule cannot be bypassed by a
+broader allow rule, so "every transfer over 10,000 needs a human" holds even
+next to an allow rule for every transfer. Rule order never matters. To allow everything, write an allow rule for `"*"`.
 Writing a deny-list on top of an allow-everything rule is possible, but a
 deny-list fails open on whatever its author did not think of.
 
@@ -45,7 +49,7 @@ version: 1
 description: Optional text.
 rules:
   - id: ap-pay-known-vendors           # unique; shown in denials and logs
-    effect: allow                      # allow | deny
+    effect: allow                      # allow | deny | approve
     description: Optional text.
     agents: [ap-agent]                 # who (globs); omitted = any caller, even anonymous
     roles: [accounts-payable]          # caller holds any of these (globs)
@@ -60,7 +64,7 @@ rules:
 | Field | Meaning |
 | --- | --- |
 | `id` | Letters, digits, `_`, `.` and `-`; unique in the file. |
-| `effect` | `allow` or `deny`. |
+| `effect` | `allow`, `deny` or `approve` (allowed only once a human approves it). |
 | `agents` | Agent ids, as globs. When present, anonymous callers never match. |
 | `roles` | Matches when the caller holds at least one listed role (globs). |
 | `upstreams` | Upstream names from the gateway configuration (globs). |
@@ -118,19 +122,22 @@ missing, when the arguments are not an object, or when a string is longer than
 8,192 characters (too long to match patterns against safely).
 
 - An allow rule holds only if every constraint is **true**.
-- A deny rule holds if no constraint is **false**, so an **unknown** constraint
-  triggers it.
+- A deny or approve rule holds if no constraint is **false**, so an **unknown**
+  constraint triggers it.
 
-So whatever the gateway cannot check, it does not let through. For example,
+So whatever the gateway cannot check, it does not let through: it refuses it,
+or puts it in front of a human. In the example finance policy, a payment to a
+vendor on file whose amount cannot be read (`"1e3"`) goes to a human instead
+of being refused outright, because the approve rule's other conditions hold. For example,
 `to_account: {equals: ACC-PAYROLL}` on a deny rule also catches
 `to_account: ["ACC-PAYROLL"]`, a value a lenient server might accept.
 
 ### `optional`
 
 By default a missing argument is unknown. That fails an allow rule and
-triggers a deny rule. `optional: true` says absence is harmless: a missing
-argument satisfies that constraint on an allow rule, and never triggers a
-deny rule.
+triggers a deny or approve rule. `optional: true` says absence is harmless: a
+missing argument satisfies that constraint on an allow rule, and never
+triggers a deny or approve rule.
 
 ```yaml
 - id: ap-read-balances
@@ -184,6 +191,11 @@ now depends on who asked.
 | `tools/call` | A tool result with `isError: true` and the text `Blocked by gateway policy: <reason>.`. The model can read this and change course. |
 | Anything else | JSON-RPC error `-32090` with the same message and `data.rule`. |
 
+A call that needs approval waits: the agent's call simply takes as long as the
+human does, and the agent receives a log notification saying so. Approved, it
+returns the tool's own result; denied, a tool error that starts
+`Denied at approval by <approver>`.
+
 The reason names the deciding rule, but not which argument failed or what
 limit applies, so a model cannot easily probe its way around the rule (for
 example by splitting one payment into several). The gateway log records the
@@ -197,5 +209,6 @@ details.
   still be slow. Keep patterns simple and anchored by design (matching is
   always full-string).
 - Policies are per call. Limits across calls, such as a daily payment total,
-  are what budgets are for (a later milestone).
+  are what the budget stage is for: a per-call limit alone does not stop an
+  agent that splits one payment into several.
 - `resources/templates/list` is not filtered.

@@ -3,8 +3,9 @@
 A denied ``tools/call`` is answered with a tool error (``isError: true``)
 carrying the reason, so the model reads it and can change course; any other
 denied request gets a JSON-RPC error. Either way the upstream never sees the
-call. Listing results are filtered to the targets the policy could allow this
-caller, and marked ``cacheScope: private`` because they now differ per caller.
+call. A call an approve rule covers is held for a human. Listing results are
+filtered to the targets the policy could allow this caller, and marked
+``cacheScope: private`` because they now differ per caller.
 """
 
 import logging
@@ -15,13 +16,14 @@ from mcp_customs.pipeline.base import (
     CONTINUE,
     ClientMessageContext,
     ClientOutcome,
+    Hold,
     Replace,
     ServerMessageContext,
     ServerOutcome,
     Stage,
 )
 from mcp_customs.pipeline.replies import error_reply, tool_error_reply
-from mcp_customs.policy.engine import PolicyEngine, PolicyRequest
+from mcp_customs.policy.engine import Effect, PolicyEngine, PolicyRequest
 from mcp_customs.policy.targets import LISTINGS, MalformedTargetError, target_of
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,10 @@ class PolicyStage(Stage):
 
     def __init__(self, engine: PolicyEngine) -> None:
         self.engine = engine
+
+    @property
+    def needs_approvals(self) -> bool:
+        return bool(getattr(self.engine, "needs_approvals", False))
 
     async def on_client_message(self, ctx: ClientMessageContext) -> ClientOutcome:
         message = ctx.message
@@ -50,12 +56,14 @@ class PolicyStage(Stage):
             PolicyRequest(identity, ctx.exchange.upstream, target.kind, target.name, target.arguments)
         )
         ctx.annotations[self.name] = {
-            "decision": "allow" if decision.allowed else "deny",
+            "decision": decision.effect.value,
             "rule": decision.rule,
             "reason": decision.reason,
         }
         if decision.allowed:
             return CONTINUE
+        if decision.effect is Effect.APPROVE:
+            return Hold(decision.reason, decision.rule)
         logger.info(
             "policy denied %s %r on %s for %s: %s %s",
             target.kind.value,
