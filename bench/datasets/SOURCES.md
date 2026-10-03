@@ -9,7 +9,7 @@ The datasets built from them record these pins, and a hash of each file, in
 | Source | Where | Pinned at | Licence | Fetched | Used for |
 | --- | --- | --- | --- | --- | --- |
 | InjecAgent (Zhan et al., 2024) | https://github.com/uiuc-kang-lab/InjecAgent | commit `f19c9f2c79a41046eb13c03c51a24c567a8ffa07` (2024-07-02) | MIT (`LICENCE` in the repo) | 2026-10-02 | Attack samples: indirect injections in tool responses, in two categories (direct harm, data stealing), base and enhanced variants |
-| AgentDojo (Debenedetti et al., 2024) | https://github.com/ethz-spylab/agentdojo | release `v0.1.35`, installed as the `agentdojo` package (`uv sync --group bench`) | MIT (`LICENSE` in the repo) | 2026-10-02 | Not yet used. Planned for the end-to-end agent evaluation and for retrieved-document injections |
+| AgentDojo (Debenedetti et al., 2024) | https://github.com/ethz-spylab/agentdojo | release `v0.1.35`, installed as the `agentdojo` package (`uv sync --group bench`) | MIT (`LICENSE` in the repo) | 2026-10-02 | Not used: the end-to-end agent evaluation was not built (Weekend 7 build notes) |
 
 ## Fetching
 

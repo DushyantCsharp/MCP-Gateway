@@ -144,3 +144,15 @@ def test_token_issue_mints_a_verifiable_token(tmp_path: Path) -> None:
 def test_token_issue_needs_a_strong_secret() -> None:
     result = runner.invoke(app, ["token", "issue", "--agent", "a"], env={"CUSTOMS_JWT_SECRET": "short"})
     assert result.exit_code == 2
+
+
+def test_check_config_finds_missing_commands(tmp_path: Path) -> None:
+    path = tmp_path / "customs.yaml"
+    path.write_text("upstreams:\n  files:\n    command: [definitely-not-a-command-4f2a]\n")
+    missing = runner.invoke(app, ["check-config", "--config", str(path)])
+    assert missing.exit_code == 2
+    assert "command 'definitely-not-a-command-4f2a' not found" in missing.output
+    path.write_text("upstreams:\n  files:\n    command: [python3, -m, server]\n")
+    ok = runner.invoke(app, ["check-config", "--config", str(path)])
+    assert ok.exit_code == 0, ok.output
+    assert "/mcp/files -> local command `python3 -m server`" in ok.output

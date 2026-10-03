@@ -23,7 +23,6 @@ import argparse
 import asyncio
 import json
 import random
-import socket
 import sys
 import threading
 import time
@@ -39,12 +38,12 @@ from typing import Any
 
 import httpx2
 import jwt
-import uvicorn
 
 sys.path.insert(0, str(Path(__file__).parent))
 from latency import ROOT, environment
 from mcp_customs.app import create_app
 from mcp_customs.config import parse_config
+from serving import serve
 
 VERSION = 1
 SECRET = "budget-bench-secret-0123456789abcdef"  # noqa: S105 - signs throwaway local tokens
@@ -92,28 +91,6 @@ class Upstream:
             }
         )
         await send({"type": "http.response.body", "body": payload})
-
-
-@contextmanager
-def serve(app: Any) -> Iterator[str]:
-    sock = socket.socket()
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("127.0.0.1", 0))
-    server = uvicorn.Server(
-        uvicorn.Config(app, log_level="warning", lifespan="on", timeout_graceful_shutdown=1)
-    )
-    thread = threading.Thread(target=server.run, kwargs={"sockets": [sock]}, daemon=True)
-    thread.start()
-    while not server.started:
-        if not thread.is_alive():
-            raise RuntimeError("server failed to start")
-        time.sleep(0.01)
-    try:
-        yield f"http://127.0.0.1:{sock.getsockname()[1]}"
-    finally:
-        server.should_exit = True
-        thread.join(timeout=10)
-        sock.close()
 
 
 @contextmanager

@@ -11,13 +11,14 @@ what comes back, and what should not cross at all.
 > log before it runs; consequential calls wait for a human, even across a
 > gateway restart; every exchange is traced; secrets and personal data are
 > redacted in both directions; and tool results are checked for prompt
-> injection, in both MCP protocol eras. The detectors have measured weaknesses
-> (below). An end-to-end agent evaluation comes next (see the
-> [roadmap](#roadmap)).
+> injection, in both MCP protocol eras, for remote servers and local (stdio)
+> ones alike. The detectors have measured weaknesses (below).
 >
-> Benchmark results (detection rate, false-positive rate, latency overhead,
-> and attack success rate with the gateway off vs on) will lead this README
-> once they exist. Nothing is claimed before it is measured.
+> What is measured: detection and false-positive rates, policy enforcement,
+> latency overhead and budget accuracy. What is not: attack success rate
+> against a live agent with the gateway off vs on. That evaluation was not
+> built (see the [build notes](docs/build-notes.md)), so no claim about it is
+> made here. Nothing is claimed before it is measured.
 
 ## Quick start
 
@@ -126,6 +127,37 @@ customs token issue --agent ap-agent        # HS256 development tokens from $CUS
 
 Both MCP transport eras work through the same endpoint: the session-based
 revisions (2024-11-05 to 2025-11-25) and the stateless 2026-07-28 revision.
+
+### Local servers
+
+Most MCP servers people run locally speak over stdin and stdout, and are
+launched by the client. Give an upstream a `command` instead of a `url`, and
+the gateway launches it, one process per client session, with every stage
+applied as for any other upstream:
+
+```yaml
+upstreams:
+  files:
+    command: [npx, -y, "@modelcontextprotocol/server-filesystem", /srv/shared]
+    env: {NODE_ENV: production}   # the process sees only this, PATH, HOME and the locale
+```
+
+The process never inherits the gateway's environment, so it cannot read the
+gateway's token secret, audit key or database credentials. For a client that
+can only launch local servers, launch `customs stdio` instead; it relays to
+the gateway over HTTP with the agent's token:
+
+```json
+{
+  "mcpServers": {
+    "files": {
+      "command": "customs",
+      "args": ["stdio", "https://customs.internal/mcp/files"],
+      "env": {"CUSTOMS_TOKEN": "<the agent's token>"}
+    }
+  }
+}
+```
 
 ## Identity and policy
 
@@ -324,7 +356,7 @@ skipped.
 
 | Path | What is there |
 | --- | --- |
-| `src/mcp_customs/proxy/` | Streamable HTTP reverse proxy, SSE relay, header and routing rules |
+| `src/mcp_customs/proxy/` | Streamable HTTP reverse proxy, SSE relay, header and routing rules, stdio upstreams |
 | `src/mcp_customs/auth/` | JWT verification, identities and scope grants, session binding |
 | `src/mcp_customs/policy/` | policy file model, rules engine, request targets |
 | `src/mcp_customs/pipeline/` | stage interface, pipeline, policy, redaction and injection stages, version-aware replies |
@@ -349,7 +381,8 @@ skipped.
 - [x] **Second detector layer and data protection:** hidden-text checks layered with the classifier on one calibrated scale, PII and secret redaction in both directions, benchmark v2
 - [ ] **More attack categories:** AgentDojo, obfuscated and multi-step attacks from public datasets
 - [x] **Approvals and budgets:** held calls in Postgres that survive a restart, approve/deny page and webhook, per-agent rate and cost limits in Redis, budget accuracy measured
-- [ ] **End-to-end agent eval:** attack success rate with the gateway off vs on, stdio wrapper
+- [x] **Local servers:** stdio upstreams launched by the gateway (one process per session, no inherited secrets), and `customs stdio` for stdio-only clients
+- [ ] **End-to-end agent eval:** attack success rate with the gateway off vs on. Not built; see the Weekend 7 build notes
 - [ ] **v0.1:** threat model, policy reference, reproducible results
 
 ## License

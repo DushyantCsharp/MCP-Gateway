@@ -53,8 +53,18 @@ type ConfigPath = Annotated[Path, AfterValidator(_resolve_path)]
 
 
 class UpstreamConfig(_Model):
-    url: AnyHttpUrl
+    url: AnyHttpUrl | None = None
     """The upstream MCP endpoint, for example ``http://workspace:8001/mcp``."""
+    command: Annotated[list[Annotated[str, Field(min_length=1)]], Field(min_length=1)] | None = None
+    """Instead of ``url``: a local MCP server to launch, one process per client session, speaking MCP
+    over stdin and stdout, for example ``[npx, -y, "@modelcontextprotocol/server-filesystem", /srv]``."""
+    env: dict[str, str] = Field(default_factory=dict)
+    """Environment for a ``command`` upstream. It inherits only PATH, HOME and the locale from the
+    gateway, never the gateway's own secrets."""
+    cwd: ConfigPath | None = None
+    """Working directory for a ``command`` upstream."""
+    max_sessions: Annotated[int, Field(ge=1, le=1000)] = 32
+    """How many processes a ``command`` upstream may run at once (one per client session)."""
 
     headers: dict[str, str] = Field(default_factory=dict)
     """Headers added to every request sent to this upstream, such as its own credentials."""
@@ -62,6 +72,20 @@ class UpstreamConfig(_Model):
     connect_timeout_s: Annotated[float, Field(gt=0)] = 5.0
     read_timeout_s: Annotated[float, Field(gt=0)] = 300.0
     """Longest gap between bytes on a request's response. Server-initiated GET streams have none."""
+
+    @model_validator(mode="after")
+    def _url_or_command(self) -> Self:
+        if (self.url is None) == (self.command is None):
+            raise ValueError("set exactly one of url and command")
+        if self.command is None and (self.env or self.cwd is not None):
+            raise ValueError("env and cwd apply only to a command upstream")
+        if self.command is not None and self.headers:
+            raise ValueError("headers apply only to a url upstream")
+        return self
+
+    @property
+    def is_local(self) -> bool:
+        return self.command is not None
 
     @field_validator("headers")
     @classmethod
@@ -360,6 +384,16 @@ class GatewayConfig(_Model):
         min_length=1
     )
     """MCP servers behind the gateway; each is served at ``/mcp/<name>``."""
+
+    @model_validator(mode="after")
+    def _route_local_upstreams(self) -> Self:
+        """A command upstream is reached at a host only this gateway resolves (see proxy/stdio.py)."""
+        for name, upstream in self.upstreams.items():
+            if upstream.command is not None and upstream.url is None:
+                self.upstreams[name] = upstream.model_copy(
+                    update={"url": f"http://{name}.stdio.internal/mcp"}
+                )
+        return self
 
     @model_validator(mode="after")
     def _approvals_need_identities(self) -> Self:

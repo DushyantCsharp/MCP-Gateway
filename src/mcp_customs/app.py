@@ -26,6 +26,7 @@ from mcp_customs.pipeline.factory import build_pipeline
 from mcp_customs.pipeline.policy import PolicyStage
 from mcp_customs.policy import RulePolicy
 from mcp_customs.proxy.observe import Instruments
+from mcp_customs.proxy.stdio import HOST_SUFFIX, StdioTransport
 from mcp_customs.proxy.streamable_http import StreamableHttpProxy
 from mcp_customs.telemetry import Telemetry
 
@@ -40,6 +41,12 @@ def describe(config: GatewayConfig, pipeline: Pipeline, audit: AuditLog | None) 
             f"mcp-customs {__version__} serving {', '.join(f'/mcp/{n}' for n in config.upstreams)}",
         )
     ]
+    for name, upstream in config.upstreams.items():
+        if upstream.command is not None:
+            command = " ".join(upstream.command)
+            lines.append(
+                (logging.INFO, f"upstream {name}: local command `{command}`, one process per session")
+            )
     if config.auth is None:
         lines.append((logging.WARNING, "auth: OFF - every caller is anonymous"))
     else:
@@ -135,6 +142,7 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         async with AsyncExitStack() as stack:
             stack.callback(telemetry.shutdown)
+            local = local_transports(config)
             client = http_client
             if client is None:
                 max_connections = config.limits.max_upstream_connections
@@ -145,8 +153,17 @@ def create_app(
                             max_keepalive_connections=min(64, max_connections),
                         ),
                         follow_redirects=False,
+                        mounts={
+                            f"http://{name}{HOST_SUFFIX}": transport for name, transport in local.items()
+                        },
                     )
                 )
+            if local:
+                processes = await stack.enter_async_context(anyio.create_task_group())
+                stack.callback(processes.cancel_scope.cancel)
+                for transport in local.values():
+                    await transport.start(processes)
+                    stack.push_async_callback(transport.aclose)
             tasks = await stack.enter_async_context(anyio.create_task_group())
             audit: AuditLog | None = None
             if config.audit is not None:
@@ -286,3 +303,19 @@ async def _open_approvals(
         retention_s=settings.retention_days * 86400,
         on_decision=record,
     )
+
+
+def local_transports(config: GatewayConfig) -> dict[str, StdioTransport]:
+    """One stdio transport per command upstream, mounted on the upstream HTTP client."""
+    return {
+        name: StdioTransport(
+            name,
+            upstream.command,
+            env=upstream.env,
+            cwd=upstream.cwd,
+            max_sessions=upstream.max_sessions,
+            max_line_bytes=config.limits.max_response_bytes,
+        )
+        for name, upstream in config.upstreams.items()
+        if upstream.command is not None
+    }

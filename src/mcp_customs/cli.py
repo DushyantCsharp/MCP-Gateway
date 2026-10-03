@@ -4,10 +4,13 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import sys
 import time
 from pathlib import Path
 from typing import Annotated, Any
 
+import anyio
 import httpx2
 import jwt
 import psycopg
@@ -57,10 +60,17 @@ def _fail(message: str) -> typer.Exit:
     return typer.Exit(code=2)
 
 
+def _check_commands(config: GatewayConfig) -> None:
+    for name, upstream in config.upstreams.items():
+        if upstream.command is not None and shutil.which(upstream.command[0]) is None:
+            raise ConfigError(f"upstream {name!r}: command {upstream.command[0]!r} not found")
+
+
 def _load(path: Path) -> GatewayConfig:
     """Load the configuration and every file it refers to, such as policies."""
     try:
         config = load_config(path)
+        _check_commands(config)
         build_pipeline(config.stages, approvals=config.approvals is not None)
         if config.auth is not None:
             JwtAuthenticator(config.auth.jwt, httpx2.AsyncClient())  # reads and checks key files
@@ -101,7 +111,8 @@ def check_config(config: ConfigOption = Path("customs.yaml")) -> None:
     settings = _load(config)
     typer.echo(f"ok: {config}")
     for name, upstream in settings.upstreams.items():
-        typer.echo(f"  /mcp/{name} -> {upstream.url}")
+        target = f"local command `{' '.join(upstream.command)}`" if upstream.command else str(upstream.url)
+        typer.echo(f"  /mcp/{name} -> {target}")
     if settings.auth is None:
         typer.echo("  auth: none (every caller is anonymous)")
     else:
@@ -364,7 +375,64 @@ def approvals_deny(
     _decide_command("deny", held_id, url, token_file, reason)
 
 
+@app.command("stdio")
+def stdio(
+    url: Annotated[str, typer.Argument(help="The gateway endpoint, such as https://gateway/mcp/workspace.")],
+    token_file: Annotated[
+        Path | None,
+        typer.Option(help="File holding the agent's bearer token; else $CUSTOMS_TOKEN.", dir_okay=False),
+    ] = None,
+) -> None:
+    """Relay MCP between stdin/stdout and the gateway, for clients that only launch local servers.
+
+    Point the client's server command at `customs stdio <url>`: every message it
+    writes goes to the gateway over HTTP with the token, and every message back
+    is written to stdout. Logs go to stderr, never stdout.
+    """
+    token = token_file.read_text().strip() if token_file is not None else os.environ.get("CUSTOMS_TOKEN")
+    logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
+    anyio.run(_relay_stdio, url, token)
+
+
+_relay_log = logging.getLogger("mcp_customs.stdio")
+
+
+async def _relay_stdio(url: str, token: str | None) -> None:
+    from mcp.client.streamable_http import streamable_http_client
+    from mcp.server.stdio import stdio_server
+
+    headers = {"authorization": f"Bearer {token}"} if token else {}
+    async with (
+        stdio_server() as (from_client, to_client),
+        httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(30.0, read=None)) as http,
+        streamable_http_client(url, http_client=http) as (from_gateway, to_gateway),
+        anyio.create_task_group() as tasks,
+    ):
+
+        async def upward() -> None:
+            async for message in from_client:
+                if isinstance(message, Exception):
+                    _relay_log.warning("unreadable message from the client: %s", message)
+                    continue
+                await to_gateway.send(message)
+            tasks.cancel_scope.cancel()  # the client closed stdin: we are done
+
+        async def downward() -> None:
+            async for message in from_gateway:
+                if isinstance(message, Exception):
+                    _relay_log.warning("gateway transport error: %s", message)
+                    continue
+                await to_client.send(message)
+
+        tasks.start_soon(upward)
+        tasks.start_soon(downward)
+
+
 @app.command()
 def version() -> None:
     """Print the version."""
     typer.echo(__version__)
+
+
+if __name__ == "__main__":
+    app()

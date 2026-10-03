@@ -665,6 +665,72 @@ one gateway or two (`bench/results/budget-v1-2026-10-03.md`).
     design working, but it confused the story, so the README and CI run the
     split payment first.
 
+## Weekend 7: local servers; the agent evaluation not built (2026-10-03)
+
+**Result:** half the weekend. The stdio work is done: local MCP servers sit
+behind the gateway, and stdio-only clients can sit in front of it. The
+end-to-end agent evaluation, the plan's headline metric (attack success rate
+against a live agent with the gateway off vs on), was not built, so its
+"done when" is not met, and its nightly CI job does not exist.
+
+### The evaluation that was not built
+
+1. **What happened.** The plan was to run AgentDojo's standard injection
+   attack against an agent driven by Claude Haiku 4.5, with AgentDojo's tools
+   served over MCP so the gateway could sit in the path. While the assistant
+   building this project was writing the harness that runs those attacks
+   against the live model, its safety classifier stopped it, and it will not
+   produce that code. The partly written harness and the MCP adapter made for
+   it were deleted. No model was called and no API key was set.
+
+2. **What that leaves.** The measured numbers are detection and false-positive
+   rates, policy enforcement, latency and budget accuracy. None of them is
+   attack success against a live agent, and the README says so instead of
+   implying it. An evaluation like this needs someone else to write and run
+   it. When it exists, AgentDojo (MIT, already pinned in `SOURCES.md`) is the
+   obvious source.
+
+### Local servers
+
+3. **No change to the proxy.** A `command` upstream is reached at a host only
+   the gateway resolves, through a streaming HTTP transport mounted on the
+   upstream client. To the proxy it is one more Streamable HTTP server, so
+   policy, budgets, approvals, redaction, injection checks and audit apply
+   without a line of new code in the request path.
+
+4. **One process per session.** A stdio server serves exactly one client, so
+   each MCP session gets its own process, ended by `DELETE`, by 30 idle
+   minutes or by the gateway stopping, and capped by `max_sessions`.
+
+5. **The handshake era is enough.** Most local servers speak only the
+   handshake era. The SDK's `auto` mode falls back to `initialize` on any
+   error from its `server/discover` probe, so answering that probe "method not
+   found" is all it takes for modern clients to use a local server.
+
+6. **A local server must not see the gateway's secrets.** By default a child
+   process inherits its parent's environment, and the gateway's holds its
+   token secret, audit key and database password. A local server, often
+   third-party code from a package registry, now sees `PATH`, `HOME`, the
+   locale and temporary-directory variables, plus the upstream's own `env`. A
+   contract test sets a variable in the gateway's environment and checks the
+   child cannot see it.
+
+7. **Routing what a stdio server says.** Over stdio, nothing ties a
+   notification to the request it belongs to. Answers go by id and progress by
+   its token. Everything else goes to the most recent waiting request, or to
+   the session's GET stream when none is waiting. That is a heuristic, and it
+   is written down as one.
+
+8. **A dead process must not leave a client waiting.** When the process
+   exits, every request it was answering gets a JSON-RPC error. Before that,
+   the test that crashes the server mid-call had nothing to wait on.
+
+9. **The SDK's transports compose.** `customs stdio` is two pumps between
+   the SDK's stdio server and its HTTP client. It needed a `python -m
+   mcp_customs.cli` entry point, which the tests use to launch it. The
+   contract tests drive the full chain in both eras: an SDK client over stdio,
+   through `customs stdio` and the gateway, to a local server over stdio.
+
 ## Follow-ups
 
 | Item | Why | When |
@@ -694,3 +760,6 @@ one gateway or two (`bench/results/budget-v1-2026-10-03.md`).
 | Wake waiting connections across replicas at once (Postgres LISTEN/NOTIFY) | A decision made on another replica is seen within `poll_s` (1 second) | After v0.1 |
 | Support MCP tasks for clients that opt in | Stream resumption covers every client today; tasks would let a client show progress | After v0.1 |
 | Refund a budget charge when the upstream fails | Charges are conservative: a failed call still counts | After v0.1 |
+| End-to-end attack success rate, gateway off vs on, and its nightly CI job | The plan's headline metric; not built (Weekend 7, findings 1 and 2) | Open |
+| Stateless-era (2026-07-28) clients for local upstreams | They speak only the handshake era today; clients in `auto` mode fall back | After v0.1 |
+| Test local upstreams on Windows | Process handling is written for POSIX and tested on macOS and Linux | Before v0.1 |
