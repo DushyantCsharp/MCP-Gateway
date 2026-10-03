@@ -77,6 +77,38 @@ rules and their semantics are in the [policy reference](policy-reference.md).
 The engine sits behind a small interface (`PolicyEngine`), so an OPA or Cedar
 adapter could replace it.
 
+## Injection detection
+
+The injection stage scores every string a model would read in the answers
+to `tools/call`, `resources/read` and `prompts/get`: text blocks, embedded
+resources and the string leaves of `structuredContent`. It acts on any
+result that scores at or above the threshold:
+
+| Mode | What the agent receives |
+| --- | --- |
+| `block` | a tool error saying the result was withheld, and why; a JSON-RPC error (`-32091`) for other methods |
+| `flag` | the result, with a warning block in front of it and the finding under `_meta["io.github.mcp-customs/injection"]` |
+| `strip` | the result, with the flagged text (or only its spans, when the detector reports them) replaced by a marker |
+
+```yaml
+stages:
+  - type: policy
+    file: policies/finance-agent.yaml
+  - type: injection
+    mode: flag          # block | flag | strip
+    threshold: 0.997    # chosen on the benchmark's dev split for about 5% false positives
+```
+
+The first detector is ProtectAI's `deberta-v3-base-prompt-injection-v2`
+(Apache-2.0, pinned revision), run on ONNX Runtime without PyTorch
+(`pip install mcp-customs[classifier]`). Scoring is CPU-bound and runs in
+worker threads, off the event loop. Its measured trade-off is in
+`bench/results/`: at the model's default threshold it flags 36% of
+legitimate tool output, and at a threshold that flags about 4% it catches
+about half the attacks. Until a better detector layer exists, run it in
+`flag` mode, not `block`. Every decision goes into the audit log and the
+span (`customs.injection.*`), so its false positives can be reviewed.
+
 ## Audit
 
 Every exchange leaves events in an append-only, hash-chained Postgres table
@@ -221,9 +253,11 @@ return `Replace(...)` to rewrite it.
 
 ## Known limitations
 
-- No injection detection, data redaction, approvals or budgets yet.
-  Identity, policy and audit hold for what they cover. The gateway does not
-  yet look inside tool results for injected instructions.
+- Injection detection is a first layer, not protection: see the measured
+  rates in `bench/results/`. It looks at one tool result at a time, so an
+  attack spread across several results is not seen as one. Long results
+  cost seconds to score. Data redaction, approvals and budgets are not built
+  yet.
 - Durable audit covers the `request` event. `result` events are written
   after the response, so a crash between the two leaves a request without
   its outcome.

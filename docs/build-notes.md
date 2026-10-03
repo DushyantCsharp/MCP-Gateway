@@ -336,6 +336,83 @@ First latency numbers are in `bench/results/`; see *Performance* below.
     changes, and records the machine's load average (3.3 here, from
     unrelated containers that were left running).
 
+## Weekend 4: injection detection, layer one (2026-10-02 to 03)
+
+**Result:** the first honest results table, misses included, is in
+`bench/results/detection-2026-10-02-classifier.md`. On the held-out test
+split, ProtectAI's DeBERTa classifier at its default threshold flags 82.0% of
+attacks [78.5, 85.0] and 36.0% of legitimate tool output [27.3, 45.8]. With
+the threshold chosen on dev for about 5% false positives, it catches 52.9%
+[48.7, 57.1] at 4.0% [1.6, 9.8].
+
+### The benchmark
+
+1. **Source attacks, do not write them.** Attack samples come only from
+   published, licensed benchmarks, pinned to a commit (InjecAgent first),
+   and are not committed: they are rebuilt from the pin. Results list
+   misses and false positives by sample id and score, never by text, so
+   publishing results never republishes attacks.
+
+2. **InjecAgent's 2,108 cases are only 62 distinct attacks.** Each attacker
+   instruction is crossed with 17 tool-output templates. A per-sample split
+   would put every instruction in both halves and inflate any tuned result.
+   The split is by instruction, and the build refuses to write if a group
+   lands in both. The cost is that the test split holds just 16 distinct
+   attacks, 5 of them exfiltration, which is why exfiltration differs by
+   16 points between dev (78.5%) and test (62.4%). The intervals say so.
+
+3. **The hardest benign class mirrors the attacks.** `paired` samples are
+   the same 17 templates with the attack slot filled by ordinary,
+   hand-written content: reviews, notes, emails, including everyday
+   requests addressed to people. A detector cannot score well by
+   recognising the format. It is also where the classifier does worst
+   (40% flagged).
+
+### The detector
+
+4. **An off-the-shelf classifier is not calibrated for tool output.** It
+   was trained on prompts, and it scores many ordinary tool fields near
+   1.0. The threshold for 5% false positives on dev is 0.9969, which is
+   why that operating point catches only about half the attacks. Run it in
+   `flag` mode; `block` would break ordinary tool use.
+
+5. **Repetition reads as injection.** Plain benign text repeated scores
+   high even within one 512-token window: one sentence repeated 20 times
+   scores 0.985, while 1,500 tokens of real prose score 0.001. Logs and
+   ledgers repeat by nature, so 81.5% of the synthetic long outputs were
+   flagged at the default threshold.
+
+6. **Long outputs are expensive.** 30 ms per sample at the median, but
+   4.8 s at p99 on an M4, because a long result needs many windows. That
+   would dominate the gateway's latency budget. Detection runs in worker
+   threads so other requests are not held up, but the call itself waits.
+
+7. **ONNX instead of PyTorch.** The model ships an ONNX export, so the
+   runtime is `onnxruntime` plus `tokenizers` (tens of megabytes) rather
+   than PyTorch (gigabytes). It is an optional extra (`[classifier]`), and
+   the model (740 MB) is downloaded once at start-up, at a pinned revision.
+
+8. **The rules layer moved.** The plan had rules first and the classifier in
+   Weekend 5. The classifier came first because it needed no hand-written
+   patterns, and its measured weaknesses now show what a cheaper layer must
+   cover.
+
+### Tooling
+
+9. AgentDojo pins `websockets` below 17 and pulls in about 60 packages, so
+   it lives in its own `bench` dependency group, which CI jobs do not
+   install.
+10. `tokenizers` 0.23 requires `huggingface-hub` below 2.0. The extra pins
+    only a floor and lets the resolver choose.
+11. **The benchmark drifted with the docs.** The `security_docs` class was
+    built from the repository's current documentation, so writing up the
+    results grew it from 102 to 121 samples and changed its hash. A rebuild
+    at a later commit would have scored a different dataset under the same
+    name. The build now reads the documents with `git show` at a pinned
+    commit, and the manifest records it. A rebuild reproduces the published
+    data's hashes exactly. Lesson: anything generated from the repository
+    must be pinned like an external source.
+
 ## Follow-ups
 
 | Item | Why | When |
@@ -346,6 +423,10 @@ First latency numbers are in `bench/results/`; see *Performance* below.
 | Anchor audit chain heads outside the database | Without that, cutting off the newest rows cannot be detected | Before v0.1 |
 | Least-privilege audit role (INSERT and SELECT only) and retention or partitioning | The demo connects as the table owner, which can drop the triggers | Before v0.1 |
 | OpenTelemetry metrics (decisions, latency histograms) | Traces exist; dashboards need metrics | After v0.1 |
+| A cheap detection layer beside the classifier (hidden characters, encodings, look-alike text, length budget) | The classifier misses about half the attacks at a usable false-positive rate, and long outputs cost seconds | Weekend 5 |
+| More attack categories: AgentDojo's retrieved documents, obfuscated and multi-step attacks | Benchmark v1 covers two categories in one format family | Weekend 5 |
+| Compare a second classifier (Meta Prompt Guard 2) on the same benchmark | One model is not a baseline | Weekend 5 |
+| Cap or stream detection on very long results | 4.8 s p99 per result | Before v0.1 |
 | Recompute `Mcp-Param-*` headers when a stage rewrites arguments | Redaction will change header-mirrored values; today the upstream rejects the mismatch, which fails closed | Weekend 5 |
 | Treat results on resumed GET streams conservatively | They arrive without the request they answer | Weekend 4 |
 | Cancel the upstream call when the client disconnects before response headers | Wasted upstream work, and a modern-era cancellation not honoured | Before v0.1 |

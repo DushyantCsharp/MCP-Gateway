@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from mcp_customs.config import ConfigError, expand_env, load_config, parse_config
+from mcp_customs.config import ConfigError, PolicyStageConfig, expand_env, load_config, parse_config
 
 
 def test_minimal_config_gets_defaults() -> None:
@@ -76,7 +76,9 @@ def test_relative_paths_resolve_against_the_config_file(tmp_path: Path) -> None:
     config = load_config(path)
     assert config.auth is not None
     assert config.auth.jwt.public_key_file == tmp_path / "conf" / "keys" / "issuer.pub"
-    assert config.stages[0].file == tmp_path / "conf" / "../policies/p.yaml"
+    stage = config.stages[0]
+    assert isinstance(stage, PolicyStageConfig)
+    assert stage.file == tmp_path / "conf" / "../policies/p.yaml"
 
 
 def test_jwt_algorithms_default_by_key_source() -> None:
