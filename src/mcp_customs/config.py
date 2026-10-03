@@ -12,6 +12,7 @@ of the configuration file, not the working directory.
 import os
 import re
 from collections.abc import Mapping
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any, Final, Literal, Self
 
@@ -212,8 +213,76 @@ class RedactionStageConfig(_Model):
         return patterns
 
 
+_DURATION: Final = re.compile(r"^\s*([1-9][0-9]*)\s*(s|m|h|d)\s*$")
+_UNIT_SECONDS: Final = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+type _Globs = Annotated[list[Annotated[str, Field(min_length=1)]], Field(min_length=1)]
+
+
+class BudgetLimitConfig(_Model):
+    """One limit: how much of something an agent may use within a rolling window."""
+
+    id: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")]
+    description: str | None = None
+    agents: _Globs | None = None
+    """Agent ids (globs) the limit applies to, each counted separately. Omitted: every caller."""
+    roles: _Globs | None = None
+    """Only callers holding one of these roles (globs)."""
+    upstreams: _Globs | None = None
+    tools: _Globs | None = None
+    """Tools (globs) whose calls count. Omitted: every tool."""
+    sum: str | None = Field(default=None, min_length=1)
+    """Add up this argument (an amount, say) instead of counting calls. A call whose argument is missing,
+    not a number or negative is refused: what cannot be measured cannot be budgeted."""
+    cost: Annotated[Decimal, Field(gt=0)] | None = None
+    """Charge this fixed cost per call instead of counting calls."""
+    limit: Annotated[Decimal, Field(gt=0, le=1_000_000_000)]
+    per: str
+    """The rolling window, such as ``60s``, ``1m``, ``24h`` or ``7d``."""
+    over: Literal["deny", "approve"] = "deny"
+    """Beyond the limit, refuse the call, or hold it for a human (which needs ``approvals``)."""
+
+    @field_validator("per")
+    @classmethod
+    def _window(cls, per: str) -> str:
+        match = _DURATION.fullmatch(per)
+        if match is None:
+            raise ValueError(f"per must look like 60s, 15m, 24h or 7d, not {per!r}")
+        if not 1 <= int(match.group(1)) * _UNIT_SECONDS[match.group(2)] <= 31 * 86400:
+            raise ValueError("per must be between 1 second and 31 days")
+        return per.strip()
+
+    @model_validator(mode="after")
+    def _one_measure(self) -> Self:
+        if self.sum is not None and self.cost is not None:
+            raise ValueError("set at most one of sum and cost")
+        return self
+
+    @property
+    def window_s(self) -> int:
+        match = _DURATION.fullmatch(self.per)
+        assert match is not None  # validated  # noqa: S101
+        return int(match.group(1)) * _UNIT_SECONDS[match.group(2)]
+
+
+class BudgetStageConfig(_Model):
+    """Per-agent rate and cost limits on tool calls, counted across calls in rolling windows."""
+
+    type: Literal["budget"]
+    redis: SecretStr | None = None
+    """Redis URL, shared by every gateway replica. Omitted: counters live in this process only."""
+    limits: Annotated[list[BudgetLimitConfig], Field(min_length=1)]
+
+    @model_validator(mode="after")
+    def _unique_ids(self) -> Self:
+        ids = [limit.id for limit in self.limits]
+        if duplicates := sorted({limit for limit in ids if ids.count(limit) > 1}):
+            raise ValueError(f"duplicate limit id(s): {', '.join(duplicates)}")
+        return self
+
+
 type StageConfig = Annotated[
-    PolicyStageConfig | InjectionStageConfig | RedactionStageConfig, Field(discriminator="type")
+    PolicyStageConfig | InjectionStageConfig | RedactionStageConfig | BudgetStageConfig,
+    Field(discriminator="type"),
 ]
 
 
@@ -296,6 +365,16 @@ class GatewayConfig(_Model):
     def _approvals_need_identities(self) -> Self:
         if self.approvals is not None and self.auth is None:
             raise ValueError("approvals need auth: approvers, like agents, are identified by their tokens")
+        return self
+
+    @model_validator(mode="after")
+    def _budget_after_policy(self) -> Self:
+        kinds = [stage.type for stage in self.stages]
+        if kinds.count("budget") > 1:
+            raise ValueError("configure one budget stage; give it several limits instead")
+        if "budget" in kinds and "policy" in kinds[kinds.index("budget") :]:
+            # A call held by policy after the budget charged it would be charged again when approved.
+            raise ValueError("the budget stage must come after the policy stage")
         return self
 
 

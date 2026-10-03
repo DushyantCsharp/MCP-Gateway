@@ -19,6 +19,7 @@ from mcp_customs.audit import AuditLog, AuditStore, AuditUnavailableError, Hashe
 from mcp_customs.audit.chain import sha256_of
 from mcp_customs.audit.events import event
 from mcp_customs.auth import JwtAuthenticator, SessionBinder
+from mcp_customs.budgets import BudgetStage
 from mcp_customs.config import ApprovalsConfig, GatewayConfig
 from mcp_customs.pipeline import Pipeline
 from mcp_customs.pipeline.factory import build_pipeline
@@ -57,6 +58,9 @@ def describe(config: GatewayConfig, pipeline: Pipeline, audit: AuditLog | None) 
         detail = ""
         if isinstance(stage, PolicyStage) and isinstance(stage.engine, RulePolicy):
             detail = f" ({len(stage.engine.document.rules)} rules)"
+        elif isinstance(stage, BudgetStage):
+            shared = "shared in Redis" if stage.backend == "redis" else "in this process only"
+            detail = f" ({len(stage.limits)} limits, counted {shared})"
         lines.append((logging.INFO, f"stage: {stage.name}{detail}"))
     if config.approvals is not None:
         settings = config.approvals

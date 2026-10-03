@@ -28,6 +28,7 @@ dependencies = [
     "pydantic>=2.13.5",
     "pyjwt[crypto]>=2.10",
     "pyyaml>=6.0.3",
+    "redis>=5.2",
     "typer>=0.27.2",
     "uvicorn[standard]>=0.54.0",
 ]
@@ -57,7 +58,7 @@ dev = [
     "pytest>=9.1",
     "pytest-cov>=7.1",
     "ruff>=0.16.10",
-    "testcontainers[postgres]>=4.15",
+    "testcontainers[postgres,redis]>=4.15",
     "types-pyyaml>=6.0.12",
 ]
 

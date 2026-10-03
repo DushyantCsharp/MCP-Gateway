@@ -122,7 +122,7 @@ def _json_equal(left: Any, right: Any) -> bool:
     return type(left) is type(right) and bool(left == right)
 
 
-def _number(value: Any) -> Decimal | None:
+def parse_decimal(value: Any) -> Decimal | None:
     """A JSON number, or a plain decimal string such as ``"18450.00"``. No exponents, no ``NaN``."""
     if isinstance(value, bool):
         return None
@@ -170,7 +170,7 @@ def _check(constraint: Constraint, value: Any) -> tuple[Tri, list[str]]:
             record((matched is expected) if checkable else None, label)
 
     if constraint.min is not None or constraint.max is not None:
-        number = _number(value)
+        number = parse_decimal(value)
         if constraint.min is not None:
             record(None if number is None else number >= constraint.min, "min")
         if constraint.max is not None:

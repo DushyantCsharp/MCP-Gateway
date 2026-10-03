@@ -58,7 +58,8 @@ jobs:
       - run: uv sync --locked
       - run: uv run pytest --cov --cov-report=term --cov-fail-under=90
         env:
-          CUSTOMS_REQUIRE_POSTGRES: "1"  # audit tests use a Postgres container; never skip them here
+          CUSTOMS_REQUIRE_POSTGRES: "1"  # audit and approval tests use a Postgres container; never skip them
+          CUSTOMS_REQUIRE_REDIS: "1"  # budget tests use a Redis container; never skip them either
 
   latency:
     name: Latency smoke

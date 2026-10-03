@@ -21,10 +21,12 @@ from mcp_customs.audit.verify import verify_database
 from mcp_customs.auth import JwtAuthenticator
 from mcp_customs.auth.identity import Identity, parse_grants
 from mcp_customs.config import (
+    BudgetStageConfig,
     ConfigError,
     GatewayConfig,
     InjectionStageConfig,
     PolicyStageConfig,
+    RedactionStageConfig,
     load_config,
 )
 from mcp_customs.pipeline.factory import build_pipeline
@@ -112,10 +114,19 @@ def check_config(config: ConfigOption = Path("customs.yaml")) -> None:
                 detail = str(stage.file)
             case InjectionStageConfig():
                 detail = f"{stage.detector}, {stage.mode}"
-            case _:
+            case RedactionStageConfig():
                 sides = f"requests {', '.join(stage.requests)}; responses {', '.join(stage.responses)}"
                 detail = f"{stage.mode}; {sides}"
+            case BudgetStageConfig():
+                where = "Redis" if stage.redis is not None else "in-process counters"
+                limits = ", ".join(f"{limit.id} {limit.limit}/{limit.per}" for limit in stage.limits)
+                detail = f"{where}; {limits}"
         typer.echo(f"  stage: {stage.type} ({detail})")
+    if settings.approvals is not None:
+        typer.echo(
+            f"  approvals: Postgres, approver role {settings.approvals.approver_role!r}, "
+            f"expire after {settings.approvals.ttl_s:g}s"
+        )
     if settings.audit is None:
         typer.echo("  audit: none (calls are not recorded)")
     else:
