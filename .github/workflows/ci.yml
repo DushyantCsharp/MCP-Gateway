@@ -86,16 +86,10 @@ jobs:
         run: docker compose -f demo/compose.yaml up --build --wait
       - name: Agent completes its task through the gateway
         run: docker compose -f demo/compose.yaml run --rm agent
-      - name: Policy blocks the over-limit payment
-        run: |
-          set +e
-          docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent
-          status=$?
-          set -e
-          if [ "$status" -ne 3 ]; then
-            echo "expected the payment to be blocked (exit 3), got exit $status"
-            exit 1
-          fi
+      - name: The daily budget holds the second half of a split payment; a human denies it
+        run: demo/scripts/held_call.sh split-payment deny 3
+      - name: A large payment waits for a human through a gateway restart, then goes through
+        run: demo/scripts/held_call.sh pay-invoice approve 0 --restart
       - name: Every call left a verifiable audit row
         run: docker compose -f demo/compose.yaml exec -T gateway customs verify-audit --key-env CUSTOMS_AUDIT_KEY
       - name: Every call left a trace in Jaeger

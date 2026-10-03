@@ -462,3 +462,40 @@ async def test_an_agent_cannot_pile_up_held_calls_and_undecided_ones_expire(fina
     assert answer["content"][0]["text"].startswith("Denied at approval: nobody decided this call")
     assert answer_of(expired)["result"] is not None
     assert jsonrpc.APPROVAL_DENIED == -32093
+
+
+async def test_the_cli_lists_and_decides_held_calls(approving: Approving, tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    from mcp_customs.cli import app as cli
+
+    reference = memo()
+    async with httpx2.AsyncClient(timeout=30) as http:
+        await RawSession(http, approving.gateway.url("finance"), AP, modern=True).request(
+            "tools/call", {"name": "transfer_funds", "arguments": transfer(amount="18450.00", memo=reference)}
+        )
+    call = await pending_call(approving.gateway, reference)
+    token_file = tmp_path / "approver.jwt"
+    token_file.write_text(APPROVER)
+    common = ["--url", approving.gateway.base, "--token-file", str(token_file)]
+    runner = CliRunner()
+
+    listed = await anyio.to_thread.run_sync(lambda: runner.invoke(cli, ["approvals", "list", *common]))
+    assert listed.exit_code == 0, listed.output
+    assert f"{call['id']}  pending   transfer_funds on finance for ap-agent" in listed.output
+    assert f'"memo": "{reference}"' in listed.output
+
+    denied = await anyio.to_thread.run_sync(
+        lambda: runner.invoke(cli, ["approvals", "deny", call["id"], "--reason", "duplicate", *common])
+    )
+    assert denied.exit_code == 0, denied.output
+    assert "denied by alice" in denied.output
+    again = await anyio.to_thread.run_sync(
+        lambda: runner.invoke(cli, ["approvals", "approve", call["id"], *common])
+    )
+    assert again.exit_code == 2
+    assert "409: the call is already denied" in again.output
+    no_token = await anyio.to_thread.run_sync(
+        lambda: runner.invoke(cli, ["approvals", "list", "--url", approving.gateway.base], env={})
+    )
+    assert no_token.exit_code == 2

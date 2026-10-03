@@ -5,9 +5,12 @@
 #
 #   docker compose -f demo/compose.yaml up --build --wait
 #   docker compose -f demo/compose.yaml run --rm agent                             # completes
-#   docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent   # blocked by policy
+#   docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent   # waits for a human
+#   docker compose -f demo/compose.yaml run --rm approver approvals list           # ...in another terminal
+#   docker compose -f demo/compose.yaml run --rm approver approvals approve <id>   # ...and it pays
 #   docker compose -f demo/compose.yaml exec gateway customs verify-audit --key-env CUSTOMS_AUDIT_KEY
 #   open http://localhost:16686                                                    # traces
+#   open http://localhost:8000/approvals                                           # held calls
 #
 # The servers are also published on localhost:8001 and :8002, so the same
 # agent can be pointed at them directly to compare. If those ports are taken,
@@ -31,6 +34,11 @@ x-token-secret: &token-secret
   # Demo only. Anyone with this secret can mint tokens; a real deployment
   # verifies tokens from its identity provider instead (auth.jwt.jwks_url).
   CUSTOMS_JWT_SECRET: ${CUSTOMS_JWT_SECRET:-demo-only-secret-never-use-in-production}
+
+x-session-secret: &session-secret
+  # Demo only. Binds handshake-era sessions to agents; a fixed key lets them, and
+  # the calls they hold for approval, survive a gateway restart.
+  CUSTOMS_SESSION_SECRET: ${CUSTOMS_SESSION_SECRET:-demo-only-session-secret-0123456789abcdef}
 
 x-audit-db: &audit-db
   POSTGRES_USER: customs
@@ -62,6 +70,13 @@ services:
       <<: *healthcheck
       test: ["CMD", "pg_isready", "-U", "customs", "-d", "customs"]
 
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--maxmemory-policy", "noeviction"]  # budgets must not be evicted
+    healthcheck:
+      <<: *healthcheck
+      test: ["CMD", "redis-cli", "ping"]
+
   jaeger:
     image: jaegertracing/jaeger:2.21.0
     ports: ["127.0.0.1:${JAEGER_PORT:-16686}:16686"]
@@ -72,8 +87,9 @@ services:
       dockerfile: Dockerfile
     image: mcp-customs:dev
     environment:
-      <<: *token-secret
+      <<: [*token-secret, *session-secret]
       CUSTOMS_AUDIT_DSN: postgresql://customs:${CUSTOMS_DB_PASSWORD:-demo-only-password}@postgres:5432/customs
+      CUSTOMS_REDIS_URL: redis://redis:6379/0
       # Demo only: the key that makes the audit chain's hashes unforgeable without it.
       CUSTOMS_AUDIT_KEY: ${CUSTOMS_AUDIT_KEY:-demo-only-audit-key}
     volumes:
@@ -84,6 +100,7 @@ services:
       workspace: {condition: service_healthy}
       finance: {condition: service_healthy}
       postgres: {condition: service_healthy}
+      redis: {condition: service_healthy}
       jaeger: {condition: service_started}
 
   issuer:
@@ -102,6 +119,18 @@ services:
       FINANCE_MCP_URL: http://gateway:8000/mcp/finance
       MCP_BEARER_TOKEN_FILE: /tokens/ap-agent.jwt
       AGENT_TASK: ${AGENT_TASK:-summary}
+    volumes: ["tokens:/tokens:ro"]
+    depends_on:
+      issuer: {condition: service_completed_successfully}
+      gateway: {condition: service_healthy}
+
+  approver:
+    image: mcp-customs:dev  # the gateway's image, for its CLI: `customs approvals list|approve|deny`
+    profiles: ["agent"]
+    command: ["approvals", "list"]
+    environment:
+      CUSTOMS_URL: http://gateway:8000
+      CUSTOMS_APPROVER_TOKEN_FILE: /tokens/approver.jwt
     volumes: ["tokens:/tokens:ro"]
     depends_on:
       issuer: {condition: service_completed_successfully}

@@ -9,8 +9,12 @@ Two tasks:
 * ``summary``: find the Northwind Logistics invoice, check the operating
   account can cover it, and email a payment summary to accounts payable.
 * ``pay-invoice``: find the same invoice and pay it. The invoice is over the
-  single-approver limit in the demo policy, so behind the gateway this call
-  is blocked, and the agent reports that instead of paying.
+  single-approver limit in the demo policy, so behind the gateway the payment
+  waits for a human: the call simply takes longer, and the agent prints the
+  gateway's notice while it waits. Approved, it pays; denied, it reports why.
+* ``split-payment``: pay the same invoice in two halves, each under the
+  single-approver limit, the way an agent would slip past a per-call limit.
+  The gateway's daily budget catches the second half and holds it for a human.
 
 The agent is deterministic on purpose, so the demo and the contract tests are
 repeatable. The model-driven agent loop used for the attack benchmark comes
@@ -32,7 +36,7 @@ from typing import Any, Literal
 import httpx2
 from mcp import Client, MCPError
 from mcp.client.streamable_http import streamable_http_client
-from mcp_types import CallToolResult, TextContent
+from mcp_types import CallToolResult, LoggingMessageNotificationParams, TextContent
 
 AP_MAILBOX = "ap@acme.example"
 POLICY_BLOCK_PREFIX = "Blocked by gateway policy"
@@ -41,7 +45,7 @@ APPROVAL_DENIED_PREFIX = "Denied at approval"
 REDACTION_META_KEY = "io.github.mcp-customs/redaction"
 EXIT_BLOCKED = 3
 
-type Task = Literal["summary", "pay-invoice"]
+type Task = Literal["summary", "pay-invoice", "split-payment"]
 
 
 class TaskFailedError(RuntimeError):
@@ -63,17 +67,26 @@ class TaskReport:
     steps: list[str] = field(default_factory=list)
 
 
+async def _print_notice(params: LoggingMessageNotificationParams) -> None:
+    """Show what the gateway says while a call waits (a payment held for approval, say)."""
+    data = params.data
+    message = data.get("message") if isinstance(data, dict) else data
+    print(f"  {params.logger or 'server'}: {message}", flush=True)
+
+
 @asynccontextmanager
 async def connect(url: str, *, mode: str, token: str | None) -> AsyncIterator[Client]:
     """An MCP client for ``url``, sending ``Authorization: Bearer <token>`` when one is given."""
     if token is None:
-        async with Client(url, mode=mode) as client:
+        async with Client(url, mode=mode, logging_callback=_print_notice) as client:
             yield client
         return
     headers = {"authorization": f"Bearer {token}"}
     async with (
         httpx2.AsyncClient(headers=headers, timeout=httpx2.Timeout(30.0, read=300.0)) as http,
-        Client(streamable_http_client(url, http_client=http), mode=mode) as client,
+        Client(
+            streamable_http_client(url, http_client=http), mode=mode, logging_callback=_print_notice
+        ) as client,
     ):
         yield client
 
@@ -165,16 +178,24 @@ async def _run_task(
         steps.append(f"get_balance -> {available} available")
         report = TaskReport(invoice_id, amount_due, available, redacted=redacted, steps=steps)
 
-        if task == "pay-invoice":
-            arguments = {
-                "from_account": "ACC-OPERATING",
-                "to_account": "ACC-NORTHWIND",
-                "amount": str(amount_due),
-                "memo": invoice_id,
-            }
-            receipt = _structured(await finance.call_tool("transfer_funds", arguments), "transfer_funds")
-            report.transfer_id = receipt["transfer_id"]
-            steps.append(f"transfer_funds -> {report.transfer_id}")
+        if task in ("pay-invoice", "split-payment"):
+            halves = 2 if task == "split-payment" else 1
+            portions = [(amount_due / halves).quantize(Decimal("0.01"))] * halves
+            portions[-1] = amount_due - sum(portions[:-1])  # the halves add up to the invoice exactly
+            paid: list[str] = []
+            for number, portion in enumerate(portions, start=1):
+                memo = invoice_id if halves == 1 else f"{invoice_id} ({number}/{halves})"
+                arguments = {
+                    "from_account": "ACC-OPERATING",
+                    "to_account": "ACC-NORTHWIND",
+                    "amount": str(portion),
+                    "memo": memo,
+                }
+                print(f"  paying {portion} ({memo})...", flush=True)
+                receipt = _structured(await finance.call_tool("transfer_funds", arguments), "transfer_funds")
+                paid.append(receipt["transfer_id"])
+                steps.append(f"transfer_funds {portion} -> {receipt['transfer_id']}")
+            report.transfer_id = ", ".join(paid)
             return report
 
         verdict = "can be paid" if available >= amount_due else "CANNOT be paid"
@@ -214,7 +235,9 @@ def main() -> None:
         "--finance-url", default=os.environ.get("FINANCE_MCP_URL", "http://127.0.0.1:8002/mcp")
     )
     parser.add_argument(
-        "--task", choices=["summary", "pay-invoice"], default=os.environ.get("AGENT_TASK", "summary")
+        "--task",
+        choices=["summary", "pay-invoice", "split-payment"],
+        default=os.environ.get("AGENT_TASK", "summary"),
     )
     parser.add_argument(
         "--mode",

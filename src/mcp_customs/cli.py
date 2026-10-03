@@ -41,6 +41,8 @@ app = typer.Typer(
 
 token_app = typer.Typer(help="Development tokens. Production tokens come from your identity provider.")
 app.add_typer(token_app, name="token")
+approvals_app = typer.Typer(help="Decide calls held for approval, through a running gateway's API.")
+app.add_typer(approvals_app, name="approvals")
 
 ConfigOption = Annotated[
     Path,
@@ -268,6 +270,98 @@ def issue_token(
     else:
         out.write_text(token)
         out.chmod(0o644)
+
+
+GatewayUrl = Annotated[str, typer.Option("--url", envvar="CUSTOMS_URL", help="The gateway's base URL.")]
+ApproverTokenFile = Annotated[
+    Path | None,
+    typer.Option(
+        envvar="CUSTOMS_APPROVER_TOKEN_FILE",
+        help="File holding an approver token; else $CUSTOMS_APPROVER_TOKEN.",
+        dir_okay=False,
+    ),
+]
+
+
+def _approvals_request(
+    method: str, url: str, path: str, token_file: Path | None, body: dict[str, Any] | None = None
+) -> Any:
+    token = (
+        token_file.read_text().strip() if token_file is not None else os.environ.get("CUSTOMS_APPROVER_TOKEN")
+    )
+    if not token:
+        raise _fail("give an approver token with --token-file or $CUSTOMS_APPROVER_TOKEN")
+    try:
+        response = httpx2.request(
+            method,
+            f"{url.rstrip('/')}/approvals/api{path}",
+            headers={"authorization": f"Bearer {token}"},
+            json=body,
+            timeout=30,
+        )
+    except httpx2.TransportError as exc:
+        raise _fail(f"cannot reach {url}: {exc}") from exc
+    if response.status_code >= 400:
+        try:
+            message = response.json().get("error", response.text)
+        except ValueError:
+            message = response.text
+        raise _fail(f"{response.status_code}: {message}")
+    return response.json()
+
+
+def _show(call: dict[str, Any]) -> str:
+    what = f"{call['target'] or call['method']} on {call['upstream']}"
+    by = f", {call['status']} by {call['decided_by']}" if call.get("decided_by") else ""
+    return f"{call['id']}  {call['status']:9} {what} for {call['agent']} ({call['reason']}){by}"
+
+
+@approvals_app.command("list")
+def approvals_list(
+    url: GatewayUrl = "http://127.0.0.1:8000",
+    token_file: ApproverTokenFile = None,
+    status: Annotated[str, typer.Option(help="pending, all, or a comma-separated list.")] = "pending",
+    as_json: Annotated[bool, typer.Option("--json", help="Print the calls as JSON.")] = False,
+) -> None:
+    """List held calls, oldest decisions last."""
+    calls = _approvals_request("GET", url, f"/calls?status={status}", token_file)
+    if as_json:
+        typer.echo(json.dumps(calls, indent=2))
+        return
+    for call in calls:
+        typer.echo(_show(call))
+        typer.echo(f"    arguments: {json.dumps(call['arguments'], sort_keys=True)}")
+
+
+def _decide_command(
+    decision: str, held_id: str, url: str, token_file: Path | None, reason: str | None
+) -> None:
+    call = _approvals_request(
+        "POST", url, f"/calls/{held_id}/decision", token_file, {"decision": decision, "reason": reason}
+    )
+    typer.echo(_show(call))
+
+
+@approvals_app.command("approve")
+def approvals_approve(
+    held_id: Annotated[str, typer.Argument(help="The held call's id.")],
+    url: GatewayUrl = "http://127.0.0.1:8000",
+    token_file: ApproverTokenFile = None,
+    reason: Annotated[str | None, typer.Option(help="Recorded, and shown to nobody but approvers.")] = None,
+) -> None:
+    """Approve a held call: it goes ahead when its agent next connects."""
+    _decide_command("approve", held_id, url, token_file, reason)
+
+
+@approvals_app.command("deny")
+def approvals_deny(
+    held_id: Annotated[str, typer.Argument(help="The held call's id.")],
+    url: GatewayUrl = "http://127.0.0.1:8000",
+    token_file: ApproverTokenFile = None,
+    reason: Annotated[str | None, typer.Option(help="Shown to the agent.")] = None,
+) -> None:
+    """Deny a held call: the agent is told, with the reason."""
+    _decide_command("deny", held_id, url, token_file, reason)
 
 
 @app.command()

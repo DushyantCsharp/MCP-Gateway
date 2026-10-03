@@ -9,10 +9,26 @@ auth:
   jwt:
     audience: mcp-customs
     secret: ${CUSTOMS_JWT_SECRET}
+  session_secret: ${CUSTOMS_SESSION_SECRET}  # a fixed key: sessions, and their held calls, survive restarts
 
 stages:
   - type: policy            # decide on the real argument values first...
-    file: policy.yaml
+    file: policy.yaml       # (payments over 10,000 wait for a human)
+  - type: budget            # ...count what each agent does across calls...
+    redis: ${CUSTOMS_REDIS_URL}
+    limits:
+      - id: ap-daily-payments
+        description: Payments add up to 10,000 a day; past that, a human decides. Catches split payments.
+        agents: [ap-agent]
+        tools: [transfer_funds]
+        sum: amount
+        limit: 10000
+        per: 24h
+        over: approve
+      - id: calls-per-minute
+        description: No agent makes more than 60 tool calls a minute.
+        limit: 60
+        per: 1m
   - type: redaction         # ...then keep secrets (out) and personal data (back) from crossing
     mode: redact
     requests: [secrets]
@@ -21,6 +37,12 @@ stages:
   - type: injection         # score what tools return before the agent reads it
     detector: hidden        # the cheap checks only; "layered" adds the classifier (740 MB model)
     mode: flag
+
+# Held calls wait here for a human: http://localhost:8000/approvals, or
+#   docker compose -f demo/compose.yaml run --rm approver approvals list
+approvals:
+  dsn: ${CUSTOMS_AUDIT_DSN}  # the audit log's database
+  secure_cookies: false      # the demo serves plain HTTP on localhost; keep the default (true) anywhere else
 
 # Every call, its decision and its outcome, hash-chained in Postgres.
 # Verify with: docker compose -f demo/compose.yaml exec gateway customs verify-audit --key-env CUSTOMS_AUDIT_KEY
