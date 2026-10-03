@@ -502,6 +502,9 @@ return `Replace(...)` to rewrite it.
 
 ## Known limitations
 
+The [threat model](threat-model.md) states what the gateway does not protect
+against; these are the implementation's own limits.
+
 - Injection detection is a first layer, not protection: see the measured
   rates in `bench/results/`. It looks at one tool result at a time, so an
   attack spread across several results is not seen as one. Long results

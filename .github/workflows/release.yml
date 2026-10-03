@@ -1,0 +1,81 @@
+name: Release
+
+# Runs when a version tag (v0.1.0, ...) is pushed: builds the package, creates
+# the GitHub release with its changelog section, and publishes the gateway's
+# container image. Publishing to PyPI runs only once the repository variable
+# PUBLISH_PYPI is "true" and PyPI trusts this workflow (trusted publishing).
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.12.22"
+
+jobs:
+  release:
+    name: GitHub release
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write  # create the release
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: The tag names the package's version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match version $version in pyproject.toml"
+            exit 1
+          fi
+      - name: Build the package
+        run: uv build --package mcp-customs
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v heading="## $version" '$0 ~ "^"heading {found=1; next} found && /^## / {exit} found' CHANGELOG.md > notes.md
+          gh release create "$GITHUB_REF_NAME" dist/* --title "mcp-customs $version" --notes-file notes.md --verify-tag
+
+  image:
+    name: Container image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write  # push to ghcr.io
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build and push ghcr.io/<owner>/mcp-customs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/mcp-customs"
+          version="${GITHUB_REF_NAME#v}"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker build --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$version" -t "$image:$version" -t "$image:latest" .
+          docker push "$image:$version"
+          docker push "$image:latest"
+
+  pypi:
+    name: PyPI
+    if: vars.PUBLISH_PYPI == 'true'
+    needs: [release]
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write  # trusted publishing: no PyPI token is stored anywhere
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv build --package mcp-customs
+      - run: uv publish --trusted-publishing always
