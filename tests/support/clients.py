@@ -58,7 +58,9 @@ def answer_of(response: httpx2.Response) -> Any:
     """The JSON-RPC answer in a response, whether framed as JSON or as SSE."""
     if response.headers.get("content-type", "").startswith("text/event-stream"):
         parser = SseParser()
-        messages = [json.loads(e.data) for e in parser.feed(response.content) if e.data is not None]
+        messages = [
+            json.loads(e.data) for e in parser.feed(response.content) if e.data
+        ]  # skip priming events
         answers = [m for m in messages if "result" in m or "error" in m]
         return answers[-1] if answers else None
     return response.json() if response.content else None

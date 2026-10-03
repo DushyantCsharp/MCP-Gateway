@@ -1,8 +1,9 @@
 """The policy file format.
 
-A policy is a list of rules. Each rule allows or denies a set of targets
-(tools, prompts, resources or other methods) on a set of upstreams, for a set
-of callers, optionally only when the call's arguments meet constraints.
+A policy is a list of rules. Each rule allows, denies or sends for approval a
+set of targets (tools, prompts, resources or other methods) on a set of
+upstreams, for a set of callers, optionally only when the call's arguments
+meet constraints.
 :mod:`mcp_customs.policy.engine` defines how rules combine; this module only
 says what a valid file looks like. See ``docs/policy-reference.md``.
 """
@@ -54,8 +55,8 @@ class Constraint(_Model):
     """Conditions on one argument. Every operator given must hold."""
 
     optional: bool = False
-    """Absence is harmless: an absent argument satisfies an allow rule and never triggers a deny
-    rule. Without it, absence is unknown, which fails an allow rule and triggers a deny rule."""
+    """Absence is harmless: an absent argument satisfies an allow rule and never triggers a deny or
+    approve rule. Without it, absence is unknown, which fails an allow rule and triggers the others."""
     equals: Scalar = None
     in_: list[Scalar] | None = Field(default=None, alias="in")
     not_in: list[Scalar] | None = None
@@ -95,7 +96,7 @@ class Constraint(_Model):
 
 class Rule(_Model):
     id: Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
-    effect: Literal["allow", "deny"]
+    effect: Literal["allow", "deny", "approve"]
     description: str | None = None
 
     agents: Patterns | None = None
@@ -123,7 +124,7 @@ class Rule(_Model):
             raise ValueError("a rule must name tools, prompts, resources or methods")
         if (self.arguments or not self.additional_arguments) and not (self.tools or self.prompts):
             raise ValueError("argument constraints apply only to tools and prompts")
-        if not self.additional_arguments and self.effect == "deny":
+        if not self.additional_arguments and self.effect != "allow":
             raise ValueError("additional_arguments: false only makes sense on an allow rule")
         return self
 

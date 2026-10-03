@@ -38,8 +38,8 @@ SECRET = "cli-test-secret-that-is-long-enough-for-hs256"
 def test_check_policy_validates_and_lists_rules() -> None:
     result = runner.invoke(app, ["check-policy", str(EXAMPLES / "finance-agent.yaml")])
     assert result.exit_code == 0
-    assert "allow ap-pay-known-vendors" in result.output
-    assert "deny  never-move-payroll" in result.output
+    assert "allow   ap-pay-known-vendors" in result.output
+    assert "deny    never-move-payroll" in result.output
 
 
 def test_check_policy_decides_a_call() -> None:
@@ -57,8 +57,15 @@ def test_check_policy_decides_a_call() -> None:
         0,
         "ALLOW: allowed by rule 'ap-pay-known-vendors'",
     )
-    denied = runner.invoke(
+    held = runner.invoke(
         app, [*base, "--agent", "ap-agent", "--arguments", small.replace("500.00", "18450.00")]
+    )
+    assert (held.exit_code, held.output.splitlines()[0]) == (
+        3,
+        "APPROVE: needs approval under rule 'ap-large-payments-need-approval'",
+    )
+    denied = runner.invoke(
+        app, [*base, "--agent", "ap-agent", "--arguments", small.replace("500.00", "60000.00")]
     )
     assert denied.exit_code == 1
     assert "argument 'amount': max failed" in denied.output
@@ -102,10 +109,15 @@ def test_check_config_loads_referenced_policies(tmp_path: Path) -> None:
         "stages:\n  - type: policy\n    file: policy.yaml\n"
         "upstreams:\n  workspace:\n    url: http://workspace:8001/mcp\n"
     )
+    approvals = "approvals:\n  dsn: postgresql://db/customs\n"
     missing = runner.invoke(app, ["check-config", "--config", str(path)], env={"SECRET": SECRET})
     assert missing.exit_code == 2
     assert "cannot read policy" in missing.output
     (tmp_path / "policy.yaml").write_text((EXAMPLES / "finance-agent.yaml").read_text())
+    unapproved = runner.invoke(app, ["check-config", "--config", str(path)], env={"SECRET": SECRET})
+    assert unapproved.exit_code == 2
+    assert "can send calls for approval, but no approvals section is configured" in unapproved.output
+    path.write_text(path.read_text() + approvals)
     ok = runner.invoke(app, ["check-config", "--config", str(path)], env={"SECRET": SECRET})
     assert ok.exit_code == 0
     assert "auth: JWT (shared secret), audience 'mcp-customs'" in ok.output

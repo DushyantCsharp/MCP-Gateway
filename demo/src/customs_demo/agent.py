@@ -36,6 +36,7 @@ from mcp_types import CallToolResult, TextContent
 
 AP_MAILBOX = "ap@acme.example"
 POLICY_BLOCK_PREFIX = "Blocked by gateway policy"
+APPROVAL_DENIED_PREFIX = "Denied at approval"
 # Where a gateway with a redaction stage says what it removed from a result.
 REDACTION_META_KEY = "io.github.mcp-customs/redaction"
 EXIT_BLOCKED = 3
@@ -84,7 +85,8 @@ def _text(result: CallToolResult) -> str:
 def _structured(result: CallToolResult, step: str) -> Any:
     if result.is_error:
         text = _text(result)
-        error = TaskBlockedError if text.startswith(POLICY_BLOCK_PREFIX) else TaskFailedError
+        blocked = text.startswith((POLICY_BLOCK_PREFIX, APPROVAL_DENIED_PREFIX))
+        error = TaskBlockedError if blocked else TaskFailedError
         raise error(f"{step}: {text}")
     if result.structured_content is None:
         raise TaskFailedError(f"{step} returned no structured content")

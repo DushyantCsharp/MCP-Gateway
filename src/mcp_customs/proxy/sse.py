@@ -126,12 +126,16 @@ class SseParser:
         pending.has_fields = True
 
 
-def encode_event(data: str, *, event: str | None = None, event_id: str | None = None) -> bytes:
+def encode_event(
+    data: str, *, event: str | None = None, event_id: str | None = None, retry_ms: int | None = None
+) -> bytes:
     """Serialise one event; multi-line data becomes multiple ``data:`` lines."""
     lines: list[str] = []
     if event is not None:
         lines.append(f"event: {event}")
     if event_id is not None:
         lines.append(f"id: {event_id}")
+    if retry_ms is not None:
+        lines.append(f"retry: {retry_ms}")
     lines.extend(f"data: {line}" for line in data.split("\n"))
     return ("\r\n".join(lines) + "\r\n\r\n").encode("utf-8")

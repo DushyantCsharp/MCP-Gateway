@@ -5,6 +5,9 @@ of the real sample servers, each wrapped in a recorder. A call counts as
 blocked only if the upstream never received it: the gateway's own report is
 not trusted. Every case in the shared decision table is sent in both protocol
 eras, then a few hundred generated transfers are fuzzed through as well.
+
+A call the policy sends for approval must not arrive either: it must be held,
+answered with a resumable stream and nothing else. Nobody approves it here.
 """
 
 import uuid
@@ -22,7 +25,9 @@ from mcp_types.version import LATEST_MODERN_VERSION
 from customs_demo import finance_server, workspace_server
 from customs_demo._serve import http_app
 from mcp_customs import jsonrpc
-from mcp_customs.policy import TargetKind
+from mcp_customs.approvals import TOKEN_PREFIX, MemoryApprovalStore
+from mcp_customs.policy import Effect, TargetKind
+from mcp_customs.proxy.sse import SseParser
 from tests.contract.conftest import Gateway, make_config, running_gateway
 from tests.support.clients import (
     TEST_AUDIENCE,
@@ -39,7 +44,7 @@ from tests.support.finance_cases import (
     FINANCE_CASES,
     INTRUDER,
     Case,
-    author_intends_to_allow,
+    author_intends,
     transfer,
     transfer_arguments,
 )
@@ -75,8 +80,10 @@ def enforced() -> Iterator[Enforced]:
             urls,
             auth={"jwt": {"audience": TEST_AUDIENCE, "secret": TEST_SECRET}},
             stages=[{"type": "policy", "file": str(POLICY)}],
+            # Held calls answer with a short stream, so the table runs quickly; nobody decides them.
+            approvals={"dsn": "postgresql://unused", "stream_s": 0.1, "max_pending_per_agent": 10_000},
         )
-        with running_gateway(config) as gateway:
+        with running_gateway(config, approval_store=MemoryApprovalStore()) as gateway:
             yield Enforced(gateway, recorders, urls)
 
 
@@ -89,6 +96,15 @@ def call_params(case: Case) -> tuple[str, dict[str, Any], dict[str, str]]:
     if case.name == "get_balance" and isinstance(account := (case.arguments or {}).get("account_id"), str):
         extra["mcp-param-account"] = account  # the tool's x-mcp-header, which modern servers require
     return method, params, extra
+
+
+def is_held(response: httpx2.Response) -> bool:
+    """A stream that opens with a resume token and carries no answer."""
+    if not response.headers.get("content-type", "").startswith("text/event-stream"):
+        return False
+    events = list(SseParser().feed(response.content))
+    first_id = events[0].id if events else None
+    return bool(first_id and first_id.startswith(TOKEN_PREFIX)) and answer_of(response) is None
 
 
 def is_policy_denial(answer: Any) -> bool:
@@ -125,15 +141,23 @@ async def test_every_disallowed_call_is_blocked_and_every_allowed_call_arrives(
             request_id, response = await sessions[key].request(method, params, extra_headers=extra)
             arrived = enforced.recorders[case.upstream].saw(request_id)
             denied = response.status_code == 401 or is_policy_denial(answer_of(response))
+            held = is_held(response)
 
-            if not case.allowed and (arrived or not denied):
-                leaked.append(f"{case.label}: arrived={arrived}, denied={denied}")
-            if case.allowed and (not arrived or denied):
-                wrongly_blocked.append(f"{case.label}: arrived={arrived}, HTTP {response.status_code}")
+            match case.expected:
+                case Effect.DENY if arrived or not denied:
+                    leaked.append(f"{case.label}: arrived={arrived}, denied={denied}")
+                case Effect.APPROVE if arrived or not held:
+                    leaked.append(f"{case.label}: arrived={arrived}, held={held}")
+                case Effect.ALLOW if not arrived or denied or held:
+                    wrongly_blocked.append(f"{case.label}: arrived={arrived}, HTTP {response.status_code}")
+                case _:
+                    pass
 
-    disallowed = sum(not case.allowed for case in FINANCE_CASES)
+    disallowed = sum(case.expected is not Effect.ALLOW for case in FINANCE_CASES)
+    held_count = sum(case.expected is Effect.APPROVE for case in FINANCE_CASES)
     print(
-        f"\n[{era}] {disallowed} disallowed calls, {disallowed - len(leaked)} blocked; "
+        f"\n[{era}] {disallowed} disallowed calls ({held_count} held for approval), "
+        f"{disallowed - len(leaked)} blocked; "
         f"{len(FINANCE_CASES) - disallowed} allowed calls, {len(wrongly_blocked)} wrongly blocked"
     )
     assert leaked == []
@@ -168,9 +192,12 @@ def test_generated_transfers_reach_the_upstream_only_when_allowed(
     }
     with httpx2.Client() as http:
         response = http.post(enforced.gateway.url("finance"), json=body, headers=headers)
-    allowed = author_intends_to_allow(arguments)
-    assert enforced.recorders["finance"].saw(request_id) is allowed
-    assert is_policy_denial(response.json()) is not allowed
+    intended = author_intends(arguments)
+    assert enforced.recorders["finance"].saw(request_id) is (intended is Effect.ALLOW)
+    if intended is Effect.APPROVE:
+        assert is_held(response)
+    else:
+        assert is_policy_denial(response.json()) is (intended is Effect.DENY)
 
 
 @pytest.mark.anyio
@@ -215,7 +242,9 @@ async def test_a_denied_payment_reads_as_a_tool_error_and_moves_nothing(
         before = (await http.get(f"{finance_base}/transfers")).json()
     async with mcp_client(enforced.gateway.url("finance"), token=mint("ap-agent"), mode=mode) as client:
         await client.list_tools()
-        result = await client.call_tool("transfer_funds", transfer(amount="18450.00"))
+        result = await client.call_tool(
+            "transfer_funds", transfer(amount="60000.00")
+        )  # over the approval cap
     assert result.is_error
     assert str(result.content).count("Blocked by gateway policy: arguments not permitted by rule") == 1
     async with httpx2.AsyncClient() as http:
@@ -240,17 +269,3 @@ async def test_the_scripted_agent_still_completes_its_task(mode: str, enforced: 
         enforced.gateway.url("workspace"), enforced.gateway.url("finance"), mode=mode, token=mint("ap-agent")
     )
     assert report.invoice_id == "inv-2026-091"
-
-
-@pytest.mark.anyio
-async def test_the_scripted_agent_reports_a_blocked_payment(mode: str, enforced: Enforced) -> None:
-    from customs_demo.agent import TaskBlockedError, run_task
-
-    with pytest.raises(TaskBlockedError, match="Blocked by gateway policy"):
-        await run_task(
-            enforced.gateway.url("workspace"),
-            enforced.gateway.url("finance"),
-            mode=mode,
-            token=mint("ap-agent"),
-            task="pay-invoice",
-        )

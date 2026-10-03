@@ -8,6 +8,13 @@ server-to-client message on the way back, and returns an outcome:
   redacted. Later stages see the replacement.
 * :class:`Respond` (client direction only) stops the message at the gateway
   and sends the given reply to the client instead, for example a denial.
+* :class:`Hold` (client direction only) stops a request until a human
+  decides it. The gateway parks the call (:mod:`mcp_customs.approvals`); once
+  it is approved, the whole pipeline runs again on the original request with
+  :attr:`ClientMessageContext.approval` set, and every ``Hold`` is then
+  treated as ``CONTINUE``. Only holds are waived: a stage that denies the
+  approved call still denies it, and a stage that charges a budget charges it
+  at that point, when the call is actually made.
 
 Stages run in the order they are configured, in both directions. A stage
 that raises fails the message closed: it is not forwarded, and the client
@@ -50,10 +57,22 @@ type Annotations = dict[str, dict[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
+class Approval:
+    """A human's approval of a held call."""
+
+    held_id: str
+    approver: str
+
+
+@dataclass(frozen=True, slots=True)
 class ClientMessageContext:
     exchange: Exchange
     message: Message
     annotations: Annotations = field(default_factory=dict)
+    approval: Approval | None = None
+    """Set when this is a held call being made after a human approved it."""
+    call_id: str | None = None
+    """Stable for one call across its hold and its approved run; stages use it as an idempotency key."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,7 +104,18 @@ class Respond:
     """Filled in by the pipeline: which stage answered."""
 
 
-type ClientOutcome = Continue | Replace | Respond
+@dataclass(frozen=True, slots=True)
+class Hold:
+    """Park this request until a human approves or denies it."""
+
+    reason: str
+    """Shown to the approver and, while the call waits, to the caller."""
+    rule: str | None = None
+    stage: str | None = None
+    """Filled in by the pipeline: which stage held the call."""
+
+
+type ClientOutcome = Continue | Replace | Respond | Hold
 type ServerOutcome = Continue | Replace
 
 
@@ -100,9 +130,25 @@ class InvalidReplacementError(ValueError):
 
 
 class Stage:
-    """Base class for pipeline stages. Override either hook or both."""
+    """Base class for pipeline stages. Override either hook or both.
+
+    A stage that holds a connection (a budget store, say) opens it in
+    :meth:`start` and releases it in :meth:`close`; the gateway calls both
+    around serving, so an unreachable dependency stops start-up.
+    """
 
     name: ClassVar[str] = "stage"
+
+    @property
+    def needs_approvals(self) -> bool:
+        """Whether this stage can hold a call for a human, so the gateway must have approvals configured."""
+        return False
+
+    async def start(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
 
     async def on_client_message(self, ctx: ClientMessageContext) -> ClientOutcome:
         return CONTINUE
@@ -170,6 +216,12 @@ class Pipeline:
             match outcome:
                 case Respond():
                     return replace(outcome, stage=stage.name)
+                case Hold():
+                    if ctx.approval is None:
+                        if not ctx.message.is_request:
+                            raise StageFailedError(stage.name)  # only a request can wait for an answer
+                        return replace(outcome, stage=stage.name)
+                    ctx.annotations.setdefault(stage.name, {})["approved_by"] = ctx.approval.approver
                 case Replace(message=raw):
                     replacement = classify(raw)
                     _check_client_replacement(ctx.message, replacement)

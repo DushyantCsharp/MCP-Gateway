@@ -61,6 +61,7 @@ def observed(pg_dsn: str) -> Iterator[Observed]:
             auth=AUTH,
             stages=[{"type": "policy", "file": str(POLICY)}],
             audit={"dsn": pg_dsn, "chain": chain, "key": AUDIT_KEY},
+            approvals={"dsn": pg_dsn},
         )
         with running_gateway(config, telemetry=spans.telemetry) as gateway:
             yield Observed(gateway, recorders, spans, pg_dsn, chain)

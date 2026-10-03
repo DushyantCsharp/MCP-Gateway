@@ -3,7 +3,7 @@ from typing import Any
 import pytest
 
 from mcp_customs.auth import Identity, parse_grants
-from mcp_customs.policy import PolicyDocument, PolicyRequest, RulePolicy, TargetKind
+from mcp_customs.policy import Effect, PolicyDocument, PolicyRequest, RulePolicy, TargetKind
 from mcp_customs.policy.engine import MAX_CHECKED_STRING
 
 AGENT = Identity("agent-1", frozenset({"staff"}))
@@ -221,6 +221,91 @@ def test_decision_details_explain_without_leaking_into_the_reason() -> None:
     decision = engine.decide(PolicyRequest(AGENT, "up", TOOL, "t", {"amount": 11}))
     assert decision.reason == "arguments not permitted by rule 'r'"
     assert decision.details == ("r: argument 'amount': max failed",)
+
+
+# -- approval -------------------------------------------------------------------------------------
+
+LARGE = {"amount": {"min": 1000}}
+
+
+def effect_of(engine: RulePolicy, arguments: Any = None, name: str = "t") -> Effect:
+    return engine.decide(PolicyRequest(AGENT, "up", TOOL, name, arguments)).effect
+
+
+def test_approve_rules_send_calls_to_a_human() -> None:
+    engine = policy(
+        {"id": "small", "effect": "allow", "tools": ["t"], "arguments": {"amount": {"max": 999}}},
+        {"id": "large", "effect": "approve", "tools": ["t"], "arguments": LARGE},
+    )
+    assert effect_of(engine, {"amount": 5}) is Effect.ALLOW
+    decision = engine.decide(PolicyRequest(AGENT, "up", TOOL, "t", {"amount": 5000}))
+    assert (decision.effect, decision.rule) == (Effect.APPROVE, "large")
+    assert decision.reason == "needs approval under rule 'large'"
+    assert not decision.allowed
+    assert engine.needs_approvals
+
+
+def test_a_broad_allow_rule_does_not_bypass_approval() -> None:
+    engine = policy(
+        {"id": "everything", "effect": "allow", "tools": ["*"]},
+        {"id": "large", "effect": "approve", "tools": ["t"], "arguments": LARGE},
+    )
+    assert effect_of(engine, {"amount": 5000}) is Effect.APPROVE
+    assert effect_of(engine, {"amount": 5}) is Effect.ALLOW
+
+
+def test_deny_beats_approve() -> None:
+    engine = policy(
+        {"id": "large", "effect": "approve", "tools": ["t"], "arguments": LARGE},
+        {"id": "never", "effect": "deny", "tools": ["t"], "arguments": {"to": {"equals": "payroll"}}},
+    )
+    assert effect_of(engine, {"amount": 5000, "to": "vendor"}) is Effect.APPROVE
+    assert effect_of(engine, {"amount": 5000, "to": "payroll"}) is Effect.DENY
+
+
+@pytest.mark.parametrize(
+    ("arguments", "effect"),
+    [
+        ({"amount": "lots"}, Effect.APPROVE),  # unknown goes to a human, not through
+        ({}, Effect.APPROVE),  # a missing argument is unknown too
+        ({"amount": 5}, Effect.DENY),  # definitely outside the rule: no rule allows it
+    ],
+)
+def test_approve_rules_fire_on_what_they_cannot_check(arguments: Any, effect: Effect) -> None:
+    engine = policy({"id": "large", "effect": "approve", "tools": ["t"], "arguments": LARGE})
+    assert effect_of(engine, arguments) is effect
+
+
+def test_an_absent_optional_argument_does_not_trigger_approval() -> None:
+    engine = policy(
+        {"id": "all", "effect": "allow", "tools": ["t"]},
+        {
+            "id": "cc",
+            "effect": "approve",
+            "tools": ["t"],
+            "arguments": {"cc": {"matches": ".+", "optional": True}},
+        },
+    )
+    assert effect_of(engine, {}) is Effect.ALLOW
+    assert effect_of(engine, {"cc": "someone"}) is Effect.APPROVE
+
+
+def test_approve_rules_cannot_refuse_additional_arguments() -> None:
+    with pytest.raises(ValueError, match="only makes sense on an allow rule"):
+        policy({"id": "r", "effect": "approve", "tools": ["t"], "additional_arguments": False})
+
+
+def test_scope_grants_still_deny_before_approval() -> None:
+    narrowed = Identity("agent-1", grants=parse_grants(["mcp:up:other"]))
+    engine = policy({"id": "large", "effect": "approve", "tools": ["t"]})
+    assert engine.decide(PolicyRequest(narrowed, "up", TOOL, "t")).effect is Effect.DENY
+
+
+def test_approvable_targets_are_visible() -> None:
+    engine = policy({"id": "large", "effect": "approve", "tools": ["t"], "arguments": LARGE})
+    assert engine.visible(AGENT, "up", TOOL, "t")
+    assert not engine.visible(AGENT, "up", TOOL, "other")
+    assert not policy({"id": "a", "effect": "allow", "tools": ["t"]}).needs_approvals
 
 
 # -- visibility -----------------------------------------------------------------------------------

@@ -74,6 +74,9 @@ class UpstreamConfig(_Model):
 class ServerConfig(_Model):
     host: str = "127.0.0.1"
     port: Annotated[int, Field(ge=0, le=65535)] = 8000
+    shutdown_grace_s: Annotated[int, Field(ge=0, le=300)] = 5
+    """How long a stopping gateway waits for open streams before cutting them. Clients resume held calls
+    and server streams on the next instance, so a restart must not wait on a stream that never ends."""
 
 
 class LimitsConfig(_Model):
@@ -238,6 +241,30 @@ class AuditConfig(_Model):
     """Create the table, index and append-only triggers at start-up if they are missing."""
 
 
+class ApprovalsConfig(_Model):
+    """Calls held for a human: kept in Postgres, decided at ``/approvals`` or through its API."""
+
+    dsn: SecretStr
+    """Postgres connection string; may be the audit log's database."""
+    approver_role: str = Field(default="approver", min_length=1)
+    """Approvers sign in with a token from the same identity provider, carrying this role."""
+    ttl_s: Annotated[float, Field(gt=0, le=7 * 86400)] = 3600.0
+    """How long a held call waits for a decision before it expires, denied."""
+    retry_ms: Annotated[int, Field(ge=100, le=60_000)] = 5000
+    """How long a client waits before reconnecting to a held call's stream. A gateway restart must take
+    less than about twice this, or the client gives up (the SDK tries twice)."""
+    stream_s: Annotated[float, Field(gt=0, le=600)] = 25.0
+    """How long one connection waits for a decision before the stream ends and the client reconnects."""
+    poll_s: Annotated[float, Field(gt=0, le=60)] = 1.0
+    """How often waiting connections check for decisions made by another gateway process."""
+    max_pending_per_agent: Annotated[int, Field(ge=1, le=10_000)] = 20
+    retention_days: Annotated[float, Field(gt=0)] = 30.0
+    """Finished held calls, which keep their arguments, are deleted after this long."""
+    secure_cookies: bool = True
+    """Mark the approvals page cookie ``Secure`` (HTTPS only). Turn off only for local HTTP."""
+    create_schema: bool = True
+
+
 class TelemetryConfig(_Model):
     """OpenTelemetry tracing, exported over OTLP/HTTP (Jaeger, Tempo, an OTel Collector...)."""
 
@@ -257,11 +284,19 @@ class GatewayConfig(_Model):
     stages: list[StageConfig] = Field(default_factory=list)
     """Pipeline stages, run in this order on every message."""
     audit: AuditConfig | None = None
+    approvals: ApprovalsConfig | None = None
+    """Without it, a call that needs a human's approval is refused."""
     telemetry: TelemetryConfig | None = None
     upstreams: dict[Annotated[str, Field(pattern=UPSTREAM_NAME_PATTERN)], UpstreamConfig] = Field(
         min_length=1
     )
     """MCP servers behind the gateway; each is served at ``/mcp/<name>``."""
+
+    @model_validator(mode="after")
+    def _approvals_need_identities(self) -> Self:
+        if self.approvals is not None and self.auth is None:
+            raise ValueError("approvals need auth: approvers, like agents, are identified by their tokens")
+        return self
 
 
 def expand_env(value: Any, environ: Mapping[str, str] | None = None) -> Any:

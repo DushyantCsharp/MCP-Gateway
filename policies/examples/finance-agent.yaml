@@ -1,9 +1,9 @@
 # An accounts-payable agent: it reads documents and balances, emails only
 # internal addresses, and pays known vendors from the operating account up to
-# the single-approver limit. Larger payments are denied here; once approvals
-# land they will wait for a human instead.
+# the single-approver limit. Larger payments, up to 50,000, wait for a human.
 #
-# Nothing is allowed unless a rule says so, and a deny rule beats any allow.
+# Nothing is allowed unless a rule says so. A deny rule beats everything, and
+# an approve rule beats an allow rule.
 version: 1
 description: Accounts-payable agent for the demo workspace and finance servers.
 
@@ -48,6 +48,18 @@ rules:
       amount: {min: 0.01, max: 10000}
       memo: {max_length: 140}
     additional_arguments: false
+
+  - id: ap-large-payments-need-approval
+    description: Payments above the single-approver limit wait for a human, up to 50,000.
+    effect: approve
+    agents: [ap-agent]
+    upstreams: [finance]
+    tools: [transfer_funds]
+    arguments:
+      from_account: {equals: ACC-OPERATING}
+      to_account: {in: [ACC-NORTHWIND]}
+      amount: {min: 10000.01, max: 50000}
+      memo: {max_length: 140}
 
   - id: never-move-payroll
     description: No agent moves money out of payroll, whatever else is allowed.

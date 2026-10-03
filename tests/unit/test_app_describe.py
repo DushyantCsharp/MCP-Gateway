@@ -26,11 +26,15 @@ def test_a_protected_gateway_lists_what_it_enforces() -> None:
             "auth": {"jwt": {"audience": "mcp-customs", "jwks_url": "https://idp.example/jwks"}},
             "stages": [{"type": "policy", "file": str(POLICY)}],
             "telemetry": {"otlp_endpoint": "http://jaeger:4318"},
+            "approvals": {"dsn": "postgresql://db/customs"},
             "upstreams": {"w": {"url": "http://w/mcp"}, "f": {"url": "http://f/mcp"}},
         }
     )
-    lines = [text for _, text in describe(config, build_pipeline(config.stages), None)]
+    lines = [text for _, text in describe(config, build_pipeline(config.stages, approvals=True), None)]
     assert lines[0].endswith("serving /mcp/w, /mcp/f")
     assert "auth: JWT (JWKS https://idp.example/jwks), audience 'mcp-customs'" in lines
-    assert "stage: policy (6 rules)" in lines
+    assert "stage: policy (7 rules)" in lines
+    assert (
+        "approvals: held calls in Postgres, decided at /approvals by role 'approver', expire after 3600s"
+    ) in lines
     assert "telemetry: OTLP to http://jaeger:4318/" in lines

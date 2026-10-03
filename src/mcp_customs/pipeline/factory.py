@@ -54,6 +54,17 @@ def build_stage(config: StageConfig) -> Stage:
             )
 
 
-def build_pipeline(configs: Sequence[StageConfig]) -> Pipeline:
-    """Load every stage now, so a broken policy file stops the gateway at start-up."""
-    return Pipeline([build_stage(config) for config in configs])
+def build_pipeline(configs: Sequence[StageConfig], *, approvals: bool = False) -> Pipeline:
+    """Load every stage now, so a broken policy file stops the gateway at start-up.
+
+    ``approvals`` says whether the gateway can hold calls for a human; a stage
+    that would hold calls without it is a configuration error, not a surprise
+    denial at run time.
+    """
+    pipeline = Pipeline([build_stage(config) for config in configs])
+    if not approvals and (holding := [stage.name for stage in pipeline.stages if stage.needs_approvals]):
+        raise ConfigError(
+            f"the {', '.join(holding)} stage can send calls for approval, "
+            "but no approvals section is configured"
+        )
+    return pipeline

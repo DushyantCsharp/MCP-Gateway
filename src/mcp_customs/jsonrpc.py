@@ -35,6 +35,14 @@ UNAUTHENTICATED: Final = -32083
 SESSION_NOT_FOUND: Final = -32084
 AUDIT_UNAVAILABLE: Final = -32085
 POLICY_DENIED: Final = -32090
+# -32091 and -32092 belong to the injection and redaction stages.
+APPROVAL_DENIED: Final = -32093
+"""A human denied the held call, or nobody decided it before it expired."""
+APPROVAL_UNAVAILABLE: Final = -32094
+"""The call needs a human's approval, which this gateway or this client cannot arrange."""
+OUTCOME_UNKNOWN: Final = -32095
+"""An approved call was sent upstream, but its answer was lost; it is never retried."""
+BUDGET_EXCEEDED: Final = -32096
 
 
 class MessageKind(StrEnum):

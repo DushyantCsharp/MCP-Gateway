@@ -28,7 +28,7 @@ from mcp_customs.config import (
     load_config,
 )
 from mcp_customs.pipeline.factory import build_pipeline
-from mcp_customs.policy import PolicyError, PolicyRequest, RulePolicy, TargetKind
+from mcp_customs.policy import Effect, PolicyError, PolicyRequest, RulePolicy, TargetKind
 
 app = typer.Typer(
     name="customs",
@@ -57,7 +57,7 @@ def _load(path: Path) -> GatewayConfig:
     """Load the configuration and every file it refers to, such as policies."""
     try:
         config = load_config(path)
-        build_pipeline(config.stages)
+        build_pipeline(config.stages, approvals=config.approvals is not None)
         if config.auth is not None:
             JwtAuthenticator(config.auth.jwt, httpx2.AsyncClient())  # reads and checks key files
     except (ConfigError, PolicyError) as exc:
@@ -87,6 +87,7 @@ def run(
         log_level=log_level.lower(),
         server_header=False,
         proxy_headers=False,
+        timeout_graceful_shutdown=settings.server.shutdown_grace_s,
     )
 
 
@@ -176,7 +177,8 @@ def check_policy(
 ) -> None:
     """Validate a policy; with a call described, decide it.
 
-    Exit status: 0 when the call is allowed (or the policy is valid), 1 when denied, 2 on errors.
+    Exit status: 0 when the call is allowed (or the policy is valid), 1 when denied, 2 on errors,
+    3 when it needs a human's approval.
     """
     try:
         engine = RulePolicy.load(policy)
@@ -195,7 +197,7 @@ def check_policy(
     if not targets:
         typer.echo(f"ok: {policy} ({len(engine.document.rules)} rules)")
         for rule in engine.document.rules:
-            typer.echo(f"  {rule.effect:5} {rule.id}")
+            typer.echo(f"  {rule.effect:7} {rule.id}")
         return
     if len(targets) > 1 or upstream is None:
         raise _fail("describe one call: --upstream and exactly one of --tool, --prompt, --resource, --method")
@@ -207,11 +209,16 @@ def check_policy(
     identity = Identity(agent, frozenset(role or ()), grants=grants) if agent is not None else None
     ((kind, name),) = targets
     decision = engine.decide(PolicyRequest(identity, upstream, kind, name, args))
-    typer.echo(f"{'ALLOW' if decision.allowed else 'DENY'}: {decision.reason}")
+    typer.echo(f"{decision.effect.value.upper()}: {decision.reason}")
     for detail in decision.details:
         typer.echo(f"  {detail}")
-    if not decision.allowed:
-        raise typer.Exit(code=1)
+    match decision.effect:
+        case Effect.DENY:
+            raise typer.Exit(code=1)
+        case Effect.APPROVE:
+            raise typer.Exit(code=3)
+        case Effect.ALLOW:
+            pass
 
 
 @token_app.command("issue")

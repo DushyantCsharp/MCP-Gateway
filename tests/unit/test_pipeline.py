@@ -4,9 +4,11 @@ from starlette.datastructures import Headers
 from mcp_customs.jsonrpc import parse_message
 from mcp_customs.pipeline import (
     CONTINUE,
+    Approval,
     ClientMessageContext,
     ClientOutcome,
     Exchange,
+    Hold,
     Pipeline,
     Replace,
     Respond,
@@ -80,6 +82,45 @@ async def test_respond_stops_the_pipeline() -> None:
     pipeline = Pipeline([Recorder("one", log, Respond(reply)), Recorder("two", log)])
     assert await pipeline.client_message(client_ctx()) == Respond(reply, stage="stage")
     assert log == ["one:a"]
+
+
+@pytest.mark.anyio
+async def test_hold_stops_the_pipeline_until_approved() -> None:
+    log: list[str] = []
+    pipeline = Pipeline([Recorder("one", log, Hold("needs a human", "r1")), Recorder("two", log)])
+    assert await pipeline.client_message(client_ctx()) == Hold("needs a human", "r1", stage="stage")
+    assert log == ["one:a"]
+
+
+@pytest.mark.anyio
+async def test_an_approved_call_runs_every_stage_and_records_the_approver() -> None:
+    log: list[str] = []
+    pipeline = Pipeline([Recorder("one", log, Hold("needs a human")), Recorder("two", log)])
+    ctx = ClientMessageContext(exchange(), parse_message(CALL), approval=Approval("h1", "alice"))
+    assert await pipeline.client_message(ctx) is CONTINUE
+    assert log == ["one:a", "two:a"]
+    assert ctx.annotations["stage"] == {"approved_by": "alice"}
+
+
+@pytest.mark.anyio
+async def test_approval_waives_holds_but_not_denials() -> None:
+    reply = {"jsonrpc": "2.0", "id": 1, "error": {"code": -1, "message": "no"}}
+    pipeline = Pipeline([Recorder("one", [], Hold("needs a human")), Recorder("two", [], Respond(reply))])
+    ctx = ClientMessageContext(exchange(), parse_message(CALL), approval=Approval("h1", "alice"))
+    assert await pipeline.client_message(ctx) == Respond(reply, stage="stage")
+
+
+@pytest.mark.anyio
+async def test_only_a_request_can_be_held() -> None:
+    class HoldsEverything(Stage):
+        name = "holder"
+
+        async def on_client_message(self, ctx: ClientMessageContext) -> ClientOutcome:
+            return Hold("no")
+
+    notification = parse_message(b'{"jsonrpc":"2.0","method":"notifications/initialized"}')
+    with pytest.raises(StageFailedError, match="holder"):
+        await Pipeline([HoldsEverything()]).client_message(ClientMessageContext(exchange(), notification))
 
 
 @pytest.mark.anyio
