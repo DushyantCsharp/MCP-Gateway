@@ -4,14 +4,16 @@ A security and governance gateway for MCP. It sits between an agent and its
 MCP servers and inspects every message in both directions: what goes out,
 what comes back, and what should not cross at all.
 
-> **Status: pre-release: identity, policy, audit, tracing, redaction and
-> two injection detector layers.** With them configured, every request is
-> authenticated, every tool call is checked against a policy and recorded in a
-> hash-chained audit log before it runs, every exchange is traced, secrets and
-> personal data are redacted in both directions, and tool results are checked
-> for prompt injection, in both MCP protocol eras. The detectors have measured
-> weaknesses (below). Approvals and budgets land over the coming milestones
-> (see the [roadmap](#roadmap)).
+> **Status: pre-release: identity, policy, approvals, budgets, audit,
+> tracing, redaction and two injection detector layers.** With them
+> configured, every request is authenticated; every tool call is checked
+> against a policy and per-agent budgets, and recorded in a hash-chained audit
+> log before it runs; consequential calls wait for a human, even across a
+> gateway restart; every exchange is traced; secrets and personal data are
+> redacted in both directions; and tool results are checked for prompt
+> injection, in both MCP protocol eras. The detectors have measured weaknesses
+> (below). An end-to-end agent evaluation comes next (see the
+> [roadmap](#roadmap)).
 >
 > Benchmark results (detection rate, false-positive rate, latency overhead,
 > and attack success rate with the gateway off vs on) will lead this README
@@ -23,27 +25,45 @@ Requires Docker.
 
 ```bash
 docker compose -f demo/compose.yaml up --build --wait
-docker compose -f demo/compose.yaml run --rm agent                            # TASK COMPLETE
-docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent  # TASK BLOCKED
+docker compose -f demo/compose.yaml run --rm agent                              # TASK COMPLETE
+docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=split-payment agent  # second half waits...
+docker compose -f demo/compose.yaml run --rm -e AGENT_TASK=pay-invoice agent    # waits for a human...
+```
+
+and, in a second terminal, play the human:
+
+```bash
+docker compose -f demo/compose.yaml run --rm approver approvals list            # what is waiting
+docker compose -f demo/compose.yaml run --rm approver approvals approve <id>    # or: deny <id> --reason ...
 docker compose -f demo/compose.yaml exec gateway customs verify-audit --key-env CUSTOMS_AUDIT_KEY
-open http://localhost:16686                                                   # the traces, in Jaeger
+open http://localhost:16686                                                     # the traces, in Jaeger
 ```
 
 This starts two sample MCP servers (`workspace`: documents and email;
 `finance`: balances and transfers) with the gateway in front of them. The
-gateway requires tokens and enforces the
-[example finance policy](policies/examples/finance-agent.yaml), redacts
-personal data from results and flags hidden text in them. A stand-in
-identity provider mints the agent's token, and a scripted agent then
-summarises an invoice (allowed) and tries to pay it. The payment of 18,450 is
-over the policy's 10,000 single-approver limit, so the gateway blocks it and
-the agent reads why. To try other identities, add
+gateway requires tokens, enforces the
+[example finance policy](policies/examples/finance-agent.yaml) and a daily
+payment budget, redacts personal data from results and flags hidden text in
+them. A stand-in identity provider mints the tokens, and a scripted agent:
+
+- summarises an invoice, which is allowed;
+- pays it in two halves of 9,225, each under the policy's 10,000 limit per
+  payment. The daily budget of 10,000 catches the second half and holds it;
+- pays it in one go. 18,450 is over the single-approver limit, so the payment
+  waits for a human. The agent prints the gateway's notice and simply waits.
+
+Approve the held call and the payment goes through; deny it and the agent
+reports the denial. The held call survives a gateway restart
+(`docker compose -f demo/compose.yaml restart gateway` while it waits). You
+can also decide at <http://localhost:8000/approvals>, signing in with the
+approver token (`docker compose -f demo/compose.yaml run --rm --entrypoint cat
+approver /tokens/approver.jwt`). To try other identities, add
 `-e MCP_BEARER_TOKEN_FILE=/tokens/auditor.jwt` (read-only) or
 `/tokens/intruder.jwt` (sees no tools at all).
 
-Every call, including the blocked payment and the refused token, is in the
-audit log, which `verify-audit` re-hashes end to end. Every call also has a
-trace in Jaeger, with a span per pipeline stage.
+Every call, including held, approved and denied ones, is in the audit log,
+which `verify-audit` re-hashes end to end. Every call also has a trace in
+Jaeger, with a span per pipeline stage.
 
 If ports 8000 to 8002 or 16686 are taken, set `CUSTOMS_PORT`,
 `WORKSPACE_PORT`, `FINANCE_PORT` or `JAEGER_PORT`.
@@ -78,9 +98,15 @@ auth:
 stages:
   - type: policy
     file: policies/finance-agent.yaml
+  - type: budget               # per-agent limits across calls, after policy
+    redis: ${REDIS_URL}
+    limits:
+      - {id: daily-payments, tools: [transfer_funds], sum: amount, limit: 10000, per: 24h, over: approve}
   - type: redaction            # after policy, which decides on the real values
     allow: ['.*@acme\.example']
   - type: injection            # hidden-text checks plus the classifier ([classifier] extra), flag only
+approvals:                     # where held calls wait for a human; decided at /approvals
+  dsn: ${DATABASE_URL}
 upstreams:
   workspace:
     url: http://workspace.internal:8001/mcp
@@ -108,10 +134,11 @@ revisions (2024-11-05 to 2025-11-25) and the stateless 2026-07-28 revision.
   audience. Streams and session ends need one too.
 - **Sessions belong to their agent.** Session ids are HMAC-bound to the agent
   that opened them; another agent's token cannot reuse one.
-- **Deny by default, deny beats allow.** Rules match agent, role, upstream,
-  tool and argument constraints. An argument the gateway cannot check (wrong
-  type, missing, too long) never satisfies an allow rule and always triggers a
-  deny rule.
+- **Deny by default; deny beats approve, approve beats allow.** Rules match
+  agent, role, upstream, tool and argument constraints. An argument the
+  gateway cannot check (wrong type, missing, too long) never satisfies an
+  allow rule and always triggers a deny or approve rule: it is refused, or a
+  human decides.
 - **Task-scoped tokens.** `mcp:<upstream>:<tool>` scope entries narrow a
   token to what one task needs. They can only narrow the policy, never widen it.
 - **Least visibility.** Tool, prompt and resource listings are filtered to
@@ -121,10 +148,48 @@ revisions (2024-11-05 to 2025-11-25) and the stateless 2026-07-28 revision.
 
 The enforcement suite proves the last point at the upstream, not by
 trusting the gateway's own report. A recorder wrapped around each real server
-checks a 40-case decision table in both protocol eras (29 of 29 disallowed
-calls blocked, 11 of 11 allowed calls delivered), plus 300 fuzzed transfers per
-run, against an independent restatement of the policy. See the
-[policy reference](docs/policy-reference.md).
+checks a 46-case decision table in both protocol eras (35 of 35 disallowed
+calls blocked, 5 of them held for approval; 11 of 11 allowed calls
+delivered), plus 300 fuzzed transfers per run, against an independent
+restatement of the policy. See the [policy reference](docs/policy-reference.md).
+
+## Approvals and budgets
+
+- **Consequential calls wait for a human.** A policy rule with
+  `effect: approve`, or a budget limit with `over: approve`, holds the call.
+  The agent's call simply takes as long as the human does: no agent changes.
+  The gateway keeps the call in Postgres, and the client resumes its stream
+  after a disconnect or a gateway restart (SEP-1699). A person with the
+  approver role decides at `/approvals`, through its JSON API, or with
+  `customs approvals approve <id>`.
+- **Made once, checked again.** An approved call is made at most once, after
+  the whole pipeline runs on it again. A call lost mid-flight is reported as
+  "outcome unknown", never retried. Holds, decisions and approved calls are
+  all in the audit log.
+- **Budgets across calls.** Per-agent limits on call counts, an argument's
+  sum (a daily payment total) or a fixed cost, over rolling windows, in Redis.
+  A split payment that gets under the per-call policy limit is caught by the
+  daily budget.
+
+The test that defines the milestone stops the gateway while a payment
+waits, starts a new one on the same port, approves the payment there, and
+checks the agent's original `call_tool` returns the receipt and the finance
+server recorded exactly one payment, in both protocol eras
+(`tests/contract/test_approvals_restart.py`). The Docker demo does the same
+with `docker compose restart gateway`, in CI.
+
+Budget accuracy, counted at the upstream with 200 concurrent clients firing
+2,000 calls at per-agent limits ([results](bench/results/budget-v1-2026-10-03.md)):
+
+| Limit | Counters | Gateways | Arrived past a limit |
+| --- | --- | --- | --- |
+| 50 calls per agent | Redis | 1 or 2 | 0 calls |
+| 10,000 per agent in `amount` | Redis | 1 or 2 | 0 |
+| 50 calls per agent | in each process | 2 | 400 calls |
+| 10,000 per agent in `amount` | in each process | 2 | 79,657.59 |
+
+Replicas must share Redis: with counters in each process, each replica
+admits an agent's full limit. Details: [architecture](docs/architecture.md#approvals).
 
 ## Audit and tracing
 
@@ -252,7 +317,10 @@ uv run pre-commit install       # run all of the above before each commit
 The contract tests start the sample servers, a deliberately misbehaving
 upstream and the gateway on real sockets. They drive the official MCP Python
 SDK client through the gateway in both protocol eras, over both SSE and JSON
-response framing.
+response framing. Tests of the audit log, approvals and budgets start
+throwaway Postgres and Redis containers, so they need Docker (or set
+`CUSTOMS_TEST_POSTGRES_DSN` and `CUSTOMS_TEST_REDIS_URL`); without it they are
+skipped.
 
 | Path | What is there |
 | --- | --- |
@@ -260,14 +328,16 @@ response framing.
 | `src/mcp_customs/auth/` | JWT verification, identities and scope grants, session binding |
 | `src/mcp_customs/policy/` | policy file model, rules engine, request targets |
 | `src/mcp_customs/pipeline/` | stage interface, pipeline, policy, redaction and injection stages, version-aware replies |
+| `src/mcp_customs/approvals/` | held calls in Postgres, the approval service, the approvals page and its API |
+| `src/mcp_customs/budgets/` | the budget stage, rolling-window counters in Redis (one Lua script) or memory |
 | `src/mcp_customs/audit/` | hash chain, Postgres store, group-commit writer, verification |
 | `src/mcp_customs/telemetry/` | OpenTelemetry set-up and trace-context handling |
 | `src/mcp_customs/detectors/` | detector contract, calibration and layering, hidden-text checks, the ONNX classifier, secret and PII patterns |
 | `src/mcp_customs/jsonrpc.py` | strict JSON-RPC parsing |
 | `policies/examples/` | finance, read-only and coding agent policies |
 | `demo/` | sample MCP servers, scripted agent, stand-in identity provider, Compose stack |
-| `tests/contract/` | real-client tests through a running gateway: policy enforcement, audit, traces |
-| `bench/` | latency and detection harnesses, datasets and datasheet, committed results |
+| `tests/contract/` | real-client tests through a running gateway: policy enforcement, approvals across a restart, budgets, audit, traces |
+| `bench/` | latency, detection and budget-accuracy harnesses, datasets and datasheet, committed results |
 | `docs/` | architecture, policy reference, build notes (what we found, milestone by milestone) |
 
 ## Roadmap
@@ -278,7 +348,7 @@ response framing.
 - [x] **Injection detection, layer one:** benchmark v1 (attack and hard benign sets, datasheet), injection stage with block/flag/strip, classifier detector, honest results with misses
 - [x] **Second detector layer and data protection:** hidden-text checks layered with the classifier on one calibrated scale, PII and secret redaction in both directions, benchmark v2
 - [ ] **More attack categories:** AgentDojo, obfuscated and multi-step attacks from public datasets
-- [ ] **Approvals and budgets:** held calls in Postgres, approve/deny page, per-agent rate and cost limits
+- [x] **Approvals and budgets:** held calls in Postgres that survive a restart, approve/deny page and webhook, per-agent rate and cost limits in Redis, budget accuracy measured
 - [ ] **End-to-end agent eval:** attack success rate with the gateway off vs on, stdio wrapper
 - [ ] **v0.1:** threat model, policy reference, reproducible results
 

@@ -9,7 +9,9 @@ in a container. Variants, each measured against the same upstream:
 
 ``direct``       client -> finance server (the baseline)
 ``passthrough``  client -> gateway -> server, nothing configured
-``policy``       + JWT authentication and the example finance policy
+``policy``       + JWT authentication and the example finance policy (its approve
+                 rule removed: ``get_balance`` never needs a human, and this
+                 variant has no approvals store)
 ``full``         + durable Postgres audit and OTLP tracing
 
 The call is ``tools/call get_balance`` over the stateless 2026-07-28 protocol:
@@ -44,6 +46,7 @@ from typing import Any
 
 import httpx2
 import jwt
+import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 POLICY = ROOT / "policies" / "examples" / "finance-agent.yaml"
@@ -134,11 +137,22 @@ def postgres(dsn: str | None) -> Iterator[str]:
         yield container.get_connection_url()
 
 
-def gateway_config(variant: str, upstream: str, port: int, dsn: str | None, otlp: str | None) -> str:
+def latency_policy(work: Path) -> Path:
+    """The example finance policy without approve rules: the measured call is never held."""
+    document = yaml.safe_load(POLICY.read_text())
+    document["rules"] = [rule for rule in document["rules"] if rule["effect"] != "approve"]
+    path = work / "latency-policy.yaml"  # not policy.yaml: that is the policy variant's gateway config
+    path.write_text(yaml.safe_dump(document, sort_keys=False))
+    return path
+
+
+def gateway_config(
+    variant: str, upstream: str, port: int, dsn: str | None, otlp: str | None, policy: Path
+) -> str:
     lines = [f"server: {{host: 127.0.0.1, port: {port}}}", "upstreams:", f"  finance: {{url: '{upstream}'}}"]
     if variant in ("policy", "full"):
         lines += ["auth:", "  jwt: {audience: mcp-customs, secret: '" + SECRET + "'}"]
-        lines += ["stages:", f"  - {{type: policy, file: '{POLICY}'}}"]
+        lines += ["stages:", f"  - {{type: policy, file: '{policy}'}}"]
     if variant == "full":
         lines += ["audit:", f"  dsn: '{dsn}'", f"  chain: bench-{int(time.time())}", "  key: bench-key"]
         lines += ["telemetry:", f"  otlp_endpoint: '{otlp}'"]
@@ -296,7 +310,9 @@ def run(args: argparse.Namespace) -> tuple[dict[str, Any], list[Stats]]:
                 if variant != "direct":
                     port = free_port()
                     config = work / f"{variant}.yaml"
-                    config.write_text(gateway_config(variant, upstream, port, dsn, otlp))
+                    config.write_text(
+                        gateway_config(variant, upstream, port, dsn, otlp, latency_policy(work))
+                    )
                     customs = shutil.which("customs") or "customs"
                     gateway.enter_context(
                         process(
