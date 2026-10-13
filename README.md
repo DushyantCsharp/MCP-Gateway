@@ -120,26 +120,26 @@ If ports 8000 to 8002 or 16686 are taken, set `CUSTOMS_PORT`,
 ```mermaid
 flowchart LR
     agent["Agent<br/>(any MCP client)"]
-    idp["Identity provider"]
+    req["mcp-customs, request path<br/>identity · policy · budget · redaction"]
+    res["mcp-customs, result path<br/>injection checks · redaction · listing filter"]
+    up["MCP servers<br/>(HTTP, or local stdio processes)"]
+    page["mcp-customs, approvals page<br/>/approvals"]
     approver["Approver<br/>(a person)"]
-    subgraph customs["mcp-customs"]
-        req["Request path<br/>identity · policy · budget · redaction"]
-        res["Result path<br/>injection checks · redaction · listing filter"]
-    end
+    idp["Identity provider"]
     pg[("Postgres<br/>audit chain · held calls")]
     redis[("Redis<br/>budget counters")]
-    up["MCP servers<br/>(HTTP, or local stdio processes)"]
     otel["Trace collector<br/>(OTLP)"]
 
     agent -- "tools/call + token" --> req
-    idp -. "JWKS" .-> req
-    req -- "audit row commits first;<br/>held calls wait here" --> pg
-    req -- "charge every limit at once" --> redis
-    approver -- "approve or deny at /approvals" --> customs
     req -- "forward" --> up
     up -- "result" --> res
     res -- "checked result" --> agent
-    customs -. "a span per stage" .-> otel
+    idp -. "JWKS" .-> req
+    req -- "audit row commits first,<br/>held calls wait here" --> pg
+    req -- "charge every limit at once" --> redis
+    req -. "a span per stage" .-> otel
+    approver -- "approve or deny" --> page
+    page -- "decision" --> pg
 ```
 
 The request path, stage by stage:
