@@ -53,6 +53,8 @@ POLICY = ROOT / "policies" / "examples" / "finance-agent.yaml"
 SECRET = "benchmark-secret-for-hs256-tokens-only-0123456789"  # noqa: S105 - benchmark-only signing key
 PROTOCOL = "2026-07-28"
 VARIANTS = ("direct", "passthrough", "policy", "full")
+MAX_P50_OVERHEAD_MS = 15.0
+"""What ``--check`` allows by default: the gateway's published p50 latency target."""
 
 
 @dataclass
@@ -356,7 +358,7 @@ def main() -> None:
         "--check",
         type=float,
         nargs="?",
-        const=15.0,
+        const=MAX_P50_OVERHEAD_MS,
         metavar="MS",
         help="fail if any variant's p50 overhead exceeds MS (default 15) or any call errors",
     )

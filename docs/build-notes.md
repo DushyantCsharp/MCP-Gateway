@@ -785,6 +785,42 @@ the dev split too); and budgets let nothing past a limit with Redis.
    an attack-success number that does not exist (Weekend 7), so it needs
    rewriting around the numbers that do.
 
+## After v0.1: the README checklist (2026-10-13)
+
+**Result:** the README now has a demo GIF, an architecture diagram, a
+targets-vs-measured table and a cost table, both generated from
+`bench/results`, an eval methodology, a "what breaks first at 10x" section,
+and three decision records (`docs/adr/`).
+
+1. **Writing targets down showed how few there were.** Policy (100%),
+   budgets (0 slipped) and latency (15 ms p50 added, the `--check` default)
+   had targets. Detection had none, so the table says "none set" rather
+   than inventing one after the fact. The latency target is missed at 50
+   clients (+60 ms), which the old README did not say.
+
+2. **A generated table needs a test, or it drifts.** `readme_tables.py`
+   reads the newest reports, and a unit test fails if the README disagrees.
+   The dev-chosen threshold is recomputed from the stored scores, which are
+   rounded to five places: it comes out 0.9970 against the run's 0.9969,
+   with identical counts, so the table shows three places.
+
+3. **The gateway's cost is compute, not tokens.** It calls no model API.
+   The classifier is the expensive part: up to 0.9 vCPU-seconds per result
+   on average, against about 1 ms of a gateway process per call.
+
+4. **Recording the demo found two terminal traps.** A backgrounded
+   `docker compose run` in an interactive shell is stopped by job control
+   (SIGTTIN) when it reads the terminal, so the agent never reconnected
+   after the restart. It needs `</dev/null`. A `run` without `-T` puts the
+   terminal into raw mode, and output from another process staircases. The
+   tape (`docs/media/demo.tape`) uses both fixes. A non-interactive dry-run
+   script had passed, because job control is off there.
+
+5. **Parallel image builds contend for uv's cache.** `up --build` builds
+   the gateway and demo images at once; one waited 300 s on a cache lock
+   and failed. Building them one at a time (`COMPOSE_BAKE=false docker
+   compose build <service>`) worked.
+
 ## Follow-ups
 
 | Item | Why | When |
