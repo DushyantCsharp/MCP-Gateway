@@ -112,7 +112,12 @@ def rates(scored: list[Scored], threshold: float, key: str) -> list[Rate]:
 
 def threshold_for_fpr(benign: list[Scored], max_fpr: float) -> float:
     """The lowest threshold at which at most ``max_fpr`` of dev benign samples are flagged."""
-    scores = sorted((item.score for item in benign if item.sample.split == "dev"), reverse=True)
+    return threshold_for_scores([item.score for item in benign if item.sample.split == "dev"], max_fpr)
+
+
+def threshold_for_scores(benign_scores: list[float], max_fpr: float) -> float:
+    """The lowest threshold at which at most ``max_fpr`` of these benign scores are flagged."""
+    scores = sorted(benign_scores, reverse=True)
     allowed = int(max_fpr * len(scores))
     if allowed >= len(scores):
         return 0.0

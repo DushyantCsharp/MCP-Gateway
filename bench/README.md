@@ -67,6 +67,18 @@ GIL. The gateway is one uvicorn process with uvloop and httptools, as
 - The CI smoke run uses shared runners. Its threshold catches gross
   regressions only; published numbers come from full runs on stated hardware.
 
+## README tables
+
+The README's *Targets vs measured* and *Cost* tables are generated from the
+newest results here, each row with its report's commit and date:
+
+```bash
+uv run python bench/harness/readme_tables.py          # after committing new results
+uv run python bench/harness/readme_tables.py --check  # what the unit test checks
+```
+
+Targets, the price sheet and its date live at the top of `harness/readme_tables.py`.
+
 ## Reading the first results
 
 See `results/` for the tables. The shape of the first run, and why:
