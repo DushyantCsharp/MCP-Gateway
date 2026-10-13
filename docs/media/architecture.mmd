@@ -1,0 +1,27 @@
+%% Source of docs/media/architecture-light.svg and architecture-dark.svg, shown in the README.
+%% Rendered with mermaid-cli 12 (labels as SVG text, so the images need no HTML):
+%%   echo '{"flowchart": {"htmlLabels": false}}' > /tmp/mermaid.json
+%%   npx -p @mermaid-js/mermaid-cli mmdc -c /tmp/mermaid.json -t default -b white -i docs/media/architecture.mmd -o docs/media/architecture-light.svg
+%%   npx -p @mermaid-js/mermaid-cli mmdc -c /tmp/mermaid.json -t dark -b "#0d1117" -i docs/media/architecture.mmd -o docs/media/architecture-dark.svg
+flowchart LR
+    agent["Agent<br/>(any MCP client)"]
+    req["mcp-customs, request path<br/>identity · policy · budget · redaction"]
+    res["mcp-customs, result path<br/>injection checks · redaction · listing filter"]
+    up["MCP servers<br/>(HTTP, or local stdio processes)"]
+    page["mcp-customs, approvals page<br/>/approvals"]
+    approver["Approver<br/>(a person)"]
+    idp["Identity provider"]
+    pg[("Postgres<br/>audit chain · held calls")]
+    redis[("Redis<br/>budget counters")]
+    otel["Trace collector<br/>(OTLP)"]
+
+    agent -- "tools/call + token" --> req
+    req -- "forward" --> up
+    up -- "result" --> res
+    res -- "checked result" --> agent
+    idp -. "JWKS" .-> req
+    req -- "audit row commits first,<br/>held calls wait here" --> pg
+    req -- "charge every limit at once" --> redis
+    req -. "a span per stage" .-> otel
+    approver -- "approve or deny" --> page
+    page -- "decision" --> pg

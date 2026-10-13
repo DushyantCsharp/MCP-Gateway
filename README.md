@@ -117,30 +117,12 @@ If ports 8000 to 8002 or 16686 are taken, set `CUSTOMS_PORT`,
 
 ## How it works
 
-```mermaid
-flowchart LR
-    agent["Agent<br/>(any MCP client)"]
-    req["mcp-customs, request path<br/>identity · policy · budget · redaction"]
-    res["mcp-customs, result path<br/>injection checks · redaction · listing filter"]
-    up["MCP servers<br/>(HTTP, or local stdio processes)"]
-    page["mcp-customs, approvals page<br/>/approvals"]
-    approver["Approver<br/>(a person)"]
-    idp["Identity provider"]
-    pg[("Postgres<br/>audit chain · held calls")]
-    redis[("Redis<br/>budget counters")]
-    otel["Trace collector<br/>(OTLP)"]
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/media/architecture-dark.svg">
+  <img alt="The agent sends tool calls with a token to the gateway's request path (identity, policy, budget, redaction), which commits an audit row and holds calls in Postgres, charges budget limits in Redis, sends spans to a trace collector, and forwards the call to the MCP servers. Their result passes through the gateway's result path (injection checks, redaction, listing filter) back to the agent. An identity provider supplies keys; an approver decides held calls on the gateway's approvals page." src="docs/media/architecture-light.svg">
+</picture>
 
-    agent -- "tools/call + token" --> req
-    req -- "forward" --> up
-    up -- "result" --> res
-    res -- "checked result" --> agent
-    idp -. "JWKS" .-> req
-    req -- "audit row commits first,<br/>held calls wait here" --> pg
-    req -- "charge every limit at once" --> redis
-    req -. "a span per stage" .-> otel
-    approver -- "approve or deny" --> page
-    page -- "decision" --> pg
-```
+<sub>Source: [docs/media/architecture.mmd](docs/media/architecture.mmd) (Mermaid, rendered to SVG).</sub>
 
 The request path, stage by stage:
 
